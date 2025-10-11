@@ -200,6 +200,40 @@ def screen_ticker(ticker: str) -> List[Dict]:
         })
     return rows
 
+# ---------- sorting helpers (works with %, $, dates, blanks) ----------
+def _sort_key(value):
+    if value in (None, "—", "-", ""):
+        return (1, None)
+    s = str(value).strip()
+    if s.endswith("%"):
+        try:
+            return (0, float(s[:-1]))
+        except Exception:
+            return (0, s.lower())
+    if s.startswith("$"):
+        try:
+            return (0, float(s[1:]))
+        except Exception:
+            return (0, s.lower())
+    try:
+        return (0, float(s))
+    except Exception:
+        pass
+    if len(s) == 10 and s[4:5] == "-" and s[7:8] == "-":
+        try:
+            y, m, d = map(int, s.split("-"))
+            return (0, (y, m, d))
+        except Exception:
+            return (0, s.lower())
+    return (0, s.lower())
+
+def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
+    grp, key = zip(*df[col].map(_sort_key))
+    df = df.assign(_grp=list(grp), _key=list(key))
+    # Always put non-blanks first (_grp=0), then apply asc/desc on key
+    df = df.sort_values(by=["_grp", "_key"], ascending=[True, ascending], kind="mergesort")
+    return df.drop(columns=["_grp", "_key"])
+
 # ---------- UI ----------
 st.set_page_config(page_title="Forward Vol Screener", layout="wide")
 st.title("📈 Forward Volatility Screener")
@@ -222,16 +256,26 @@ if st.button("Run Screener"):
     if "_tags" not in df.columns:
         df["_tags"] = [[] for _ in range(len(df))]
 
+    # ----- sort controls (restore sorting feature) -----
+    display_cols = [c for c in df.columns if c != "_tags"]
+    left, right = st.columns([3, 1])
+    with left:
+        sort_col = st.selectbox("Sort by", options=display_cols, index=display_cols.index("ff") if "ff" in display_cols else 0)
+    with right:
+        sort_ascending = st.toggle("Ascending", value=False)
+    df = sort_df(df, sort_col, sort_ascending)
+
+    # --- color styling ---
     def highlight(row):
         earn = "earn" in row["_tags"]
         hot = "hot" in row["_tags"]
         color = "#ffffff"
         if earn and hot:
-            color = "#ffe0b2"
+            color = "#ffe0b2"   # both
         elif earn:
-            color = "#fff9c4"
+            color = "#fff9c4"   # earnings
         elif hot:
-            color = "#dcedc8"
+            color = "#dcedc8"   # hot
         return [f"background-color:{color}; color:#000000;"] * len(row)
 
     styled = (
@@ -240,6 +284,7 @@ if st.button("Run Screener"):
         .set_properties(**{"border": "1px solid #bbb", "color": "#000", "font-size": "14px"})
     )
 
+    # readable table (sticky header + zebra stripes)
     st.markdown(
         """
         <style>
