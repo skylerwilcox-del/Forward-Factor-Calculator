@@ -7,6 +7,7 @@ import pandas as pd
 import pytz
 import streamlit as st
 import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
 # App/session setup
@@ -14,13 +15,11 @@ import yfinance as yf
 PACIFIC = pytz.timezone("America/Los_Angeles")
 st.set_page_config(page_title="Forward Vol Screener", layout="wide")
 
-# Keep results across reruns so sorting controls don't clear the table
+# Persist results across reruns (sorting control changes)
 if "df" not in st.session_state:
     st.session_state.df = None
 if "tickers" not in st.session_state:
     st.session_state.tickers = []
-if "last_run_ok" not in st.session_state:
-    st.session_state.last_run_ok = False
 
 # Friendly display names (and reverse map)
 DISPLAY_MAP = {
@@ -45,6 +44,9 @@ DISPLAY_KEYS = [
     "exp2", "dte2", "iv2", "fwd_vol", "ff",
     "cal_debit", "earn_in_window"
 ]
+
+# Concurrency for scanning (network bound → benefits from IO parallelism)
+MAX_WORKERS = 8
 
 # =========================
 # Helpers
@@ -83,10 +85,21 @@ def _expiry_to_date(expiry_iso: str) -> Optional[date]:
     except Exception:
         return None
 
+def _normalize_tickers(raw: str) -> List[str]:
+    # de-dup while preserving order
+    seen = set()
+    out = []
+    for t in raw.replace(",", " ").split():
+        t = t.strip().upper()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
 # =========================
 # yfinance (cached)
 # =========================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_spot(ticker: str) -> Optional[float]:
     tk = yf.Ticker(ticker)
     spot = tk.fast_info.get("last_price") or tk.info.get("regularMarketPrice")
@@ -96,16 +109,21 @@ def get_spot(ticker: str) -> Optional[float]:
             spot = float(px["Close"].iloc[-1])
     return _first_float(spot)
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_options(ticker: str) -> List[str]:
-    return yf.Ticker(ticker).options or []
+    try:
+        opts = yf.Ticker(ticker).options or []
+        # filter ISO-like dates just in case
+        return [e for e in opts if isinstance(e, str) and len(e) == 10 and e[4] == "-" and e[7] == "-"]
+    except Exception:
+        return []
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     oc = yf.Ticker(ticker).option_chain(expiry)
     return oc.calls.copy(), oc.puts.copy()
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_next_earnings_date(ticker: str) -> Optional[date]:
     today = _now_pacific_date()
     tk = yf.Ticker(ticker)
@@ -195,8 +213,9 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
     return fwd_sigma, ff
 
 # =========================
-# Screener
+# Screener (cached per ticker)
 # =========================
+@st.cache_data(ttl=600, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
     spot = get_spot(ticker)
     if spot is None:
@@ -258,6 +277,39 @@ def screen_ticker(ticker: str) -> List[Dict]:
         })
     return rows
 
+def scan_many(tickers: List[str]) -> pd.DataFrame:
+    """Parallel scan over tickers (network bound) with progress."""
+    rows: List[Dict] = []
+    if not tickers:
+        return pd.DataFrame(rows)
+
+    progress = st.progress(0.0, text="Starting…")
+    done = 0
+
+    # Threading is appropriate here due to IO waits in yfinance
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(tickers)))) as ex:
+        fut_map = {ex.submit(screen_ticker, t): t for t in tickers}
+        for fut in as_completed(fut_map):
+            t = fut_map[fut]
+            try:
+                rows.extend(fut.result())
+            except Exception as e:
+                rows.append({
+                    "ticker": t, "pair": "—",
+                    "exp1": "—", "dte1": "—", "iv1": "—",
+                    "exp2": "—", "dte2": "—", "iv2": "—",
+                    "fwd_vol": "—", "ff": "—", "cal_debit": "—",
+                    "earn_in_window": "—", "_tags": [f"error:{type(e).__name__}"]
+                })
+            done += 1
+            progress.progress(done / len(tickers), text=f"Scanned {t} ({done}/{len(tickers)})")
+    progress.empty()
+
+    df = pd.DataFrame(rows)
+    if "_tags" not in df.columns:
+        df["_tags"] = [[] for _ in range(len(df))]
+    return df
+
 # =========================
 # Robust, vectorized sorting
 # =========================
@@ -290,7 +342,7 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     cur_neg = s_str.str.startswith("(") & s_str.str.endswith(")")
     cur_val = np.where(cur_neg, -cur_val, cur_val)
 
-    # Plain number (allow commas)
+    # Plain numbers (allow commas)
     num_val_plain = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
 
     # Prefer: percent > currency > plain
@@ -345,37 +397,27 @@ st.title("📈 Forward Volatility Screener")
 raw = st.text_area(
     "Tickers (comma / space separated):",
     "AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, NFLX, AMD, AVGO",
-    height=100,
+    height=96,
 )
 
-run = st.button("Run Screener")
+col_run, col_download = st.columns([1, 1], vertical_alignment="center")
+with col_run:
+    run = st.button("Run Screener", type="primary")
+with col_download:
+    # Download last results if available
+    if st.session_state.df is not None and not st.session_state.df.empty:
+        # Build display df to match on-screen headers (no _tags)
+        have_keys = [k for k in DISPLAY_KEYS if k in st.session_state.df.columns]
+        df_export = st.session_state.df[have_keys].copy()
+        df_export.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
+        csv_bytes = df_export.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", data=csv_bytes, file_name="forward_vol_screener.csv", mime="text/csv")
 
-# Compute on click, then persist results to session_state
+# Compute on click, then persist results
 if run:
-    tickers = [t.strip().upper() for t in raw.replace(",", " ").split() if t.strip()]
+    tickers = _normalize_tickers(raw)
     st.session_state.tickers = tickers
-    progress = st.progress(0.0)
-    all_rows: List[Dict] = []
-    for i, t in enumerate(tickers, 1):
-        try:
-            all_rows.extend(screen_ticker(t))
-        except Exception as e:
-            all_rows.append({
-                "ticker": t, "pair": "—",
-                "exp1": "—", "dte1": "—", "iv1": "—",
-                "exp2": "—", "dte2": "—", "iv2": "—",
-                "fwd_vol": "—", "ff": "—", "cal_debit": "—",
-                "earn_in_window": "—", "_tags": [f"error:{type(e).__name__}"]
-            })
-        progress.progress(i / len(tickers), text=f"Scanning {t}…")
-    progress.empty()
-
-    df = pd.DataFrame(all_rows)
-    if "_tags" not in df.columns:
-        df["_tags"] = [[] for _ in range(len(df))]
-
-    st.session_state.df = df
-    st.session_state.last_run_ok = True
+    st.session_state.df = scan_many(tickers)
 
 # --------- Render/sort outside the button block ---------
 df_current = st.session_state.df
@@ -383,13 +425,14 @@ df_current = st.session_state.df
 if df_current is None or df_current.empty:
     st.info("Enter tickers and click **Run Screener** to see results.")
 else:
-    # Sorting controls use friendly labels, but map back to real keys
+    # Sorting controls use friendly labels, then map back to real keys
     display_labels = [DISPLAY_MAP[k] for k in DISPLAY_KEYS if k in df_current.columns]
     default_label = DISPLAY_MAP["ff"] if "ff" in df_current.columns else display_labels[0]
 
     c1, c2, c3 = st.columns([3, 1.2, 1.8], vertical_alignment="bottom")
     with c1:
-        sort_label = st.selectbox("Sort by", options=display_labels, index=display_labels.index(default_label), key="sort_col_label")
+        sort_label = st.selectbox("Sort by", options=display_labels,
+                                  index=display_labels.index(default_label), key="sort_col_label")
     with c2:
         sort_ascending = st.toggle("Ascending", value=False, key="sort_asc")
     with c3:
@@ -404,10 +447,10 @@ else:
     df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
 
     # --- Row highlighting based on hidden _tags (kept in df_sorted) ---
-    tags_series = df_sorted["_tags"] if "_tags" in df_sorted.columns else pd.Series([[]]*len(df_sorted))
+    tags_series = df_sorted["_tags"] if "_tags" in df_sorted.columns else pd.Series([[]]*len(df_sorted), index=df_sorted.index)
 
     def _highlight_row(row: pd.Series):
-        tags = tags_series.iloc[row.name] if row.name < len(tags_series) else []
+        tags = tags_series.iloc[row.name] if row.name in tags_series.index else []
         earn = isinstance(tags, (list, tuple, set)) and ("earn" in tags)
         hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
         color = "#ffffff"
