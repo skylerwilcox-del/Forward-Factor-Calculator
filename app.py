@@ -44,7 +44,7 @@ def _expiry_to_date(expiry_iso: str) -> Optional[date]:
     except Exception:
         return None
 
-# ---------- yfinance wrappers ----------
+# ---------- yfinance ----------
 @st.cache_data(ttl=600)
 def get_spot(ticker: str) -> Optional[float]:
     tk = yf.Ticker(ticker)
@@ -68,7 +68,6 @@ def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
 def get_next_earnings_date(ticker: str) -> Optional[date]:
     today = _now_pacific_date()
     tk = yf.Ticker(ticker)
-    # new API
     try:
         df = tk.get_earnings_dates(limit=8)
         if df is not None and not df.empty:
@@ -79,7 +78,6 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
                 return min(fut)
     except Exception:
         pass
-    # fallback: calendar/info
     for src in (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {})):
         if src is None:
             continue
@@ -220,31 +218,33 @@ if st.button("Run Screener"):
         all_rows.extend(screen_ticker(t))
         progress.progress(i / len(tickers), text=f"Scanning {t}…")
     progress.empty()
-    df = pd.DataFrame(all_rows).drop(columns=["_tags"], errors="ignore")
+    df = pd.DataFrame(all_rows)
 
-        # --- coloring ---
+    # --- Safe drop + coloring ---
+    if "_tags" not in df.columns:
+        df["_tags"] = [[] for _ in range(len(df))]
+
     def color_row(row):
-        earn = "earn" in row.get("_tags", [])
-        hot = "hot" in row.get("_tags", [])
+        earn = "earn" in row["_tags"]
+        hot = "hot" in row["_tags"]
         if earn and hot:
-            return "#ffcc80"   # orange
+            return "#ffcc80"  # orange
         if earn:
-            return "#fff59d"   # yellow
+            return "#fff59d"  # yellow
         if hot:
-            return "#c8e6c9"   # green
+            return "#c8e6c9"  # green
         return "white"
 
     df["row_color"] = df.apply(color_row, axis=1)
 
+    # Use data_editor for live coloring
     st.data_editor(
-        df.drop(columns=["_tags"]),
+        df.drop(columns=["_tags"], errors="ignore"),
         hide_index=True,
         use_container_width=True,
-        column_order=["ticker", "pair", "exp1", "dte1", "iv1", "exp2", "dte2", "iv2", "fwd_vol", "ff", "cal_debit", "earn_in_window"],
-        column_config={},
-        key="screen_table",
         disabled=True,
         height=600,
+        key="screen_table",
         row_styles=df["row_color"].apply(lambda c: {"backgroundColor": c}).to_list(),
     )
     st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
