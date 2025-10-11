@@ -14,13 +14,37 @@ import yfinance as yf
 PACIFIC = pytz.timezone("America/Los_Angeles")
 st.set_page_config(page_title="Forward Vol Screener", layout="wide")
 
-# Initialize session state containers once
+# Keep results across reruns so sorting controls don't clear the table
 if "df" not in st.session_state:
     st.session_state.df = None
 if "tickers" not in st.session_state:
     st.session_state.tickers = []
 if "last_run_ok" not in st.session_state:
     st.session_state.last_run_ok = False
+
+# Friendly display names (and reverse map)
+DISPLAY_MAP = {
+    "ticker": "Ticker",
+    "pair": "Pair",
+    "exp1": "Exp 1",
+    "dte1": "Dte 1",
+    "iv1": "IV 1",
+    "exp2": "Exp 2",
+    "dte2": "Dte 2",
+    "iv2": "IV 2",
+    "fwd_vol": "Forward Vol",
+    "ff": "FF",
+    "cal_debit": "Call Debit",
+    "earn_in_window": "Earnings Date",
+}
+LABEL_TO_KEY = {v: k for k, v in DISPLAY_MAP.items()}
+
+# Order to display (and sort on)
+DISPLAY_KEYS = [
+    "ticker", "pair", "exp1", "dte1", "iv1",
+    "exp2", "dte2", "iv2", "fwd_vol", "ff",
+    "cal_debit", "earn_in_window"
+]
 
 # =========================
 # Helpers
@@ -95,7 +119,7 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
                 return min(fut)
     except Exception:
         pass
-    # Fallback scrapes/fields
+    # Fallback fields
     for src in (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {})):
         if src is None:
             continue
@@ -250,11 +274,11 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     s_str = s.astype(str).str.strip()
     is_blank = s.isna() | s_str.isin(_BLANK_SET)
 
-    # Parse percent: "12.34%"
+    # Percent: "12.34%"
     pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", "", regex=False), errors="coerce")
     pct_mask = s_str.str.endswith("%") & ~pd.isna(pct_val)
 
-    # Parse currency: "$1,234.56" or "($1,234.56)"
+    # Currency: "$1,234.56" or "($1,234.56)"
     cur_mask = s_str.str.match(r"^\(?\$\s*[\d,]+(?:\.\d+)?\)?$")
     cur_core = (s_str
                 .str.replace(r"^\(", "", regex=True)
@@ -269,7 +293,7 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     # Plain number (allow commas)
     num_val_plain = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
 
-    # Combine numeric preference: pct > currency > plain
+    # Prefer: percent > currency > plain
     num_key = np.where(~pd.isna(pct_val) & pct_mask, pct_val,
               np.where(~pd.isna(cur_val) & cur_mask, cur_val, num_val_plain))
     num_key = pd.to_numeric(num_key, errors="coerce")
@@ -326,7 +350,7 @@ raw = st.text_area(
 
 run = st.button("Run Screener")
 
-# Compute results only when button pressed; persist to session_state
+# Compute on click, then persist results to session_state
 if run:
     tickers = [t.strip().upper() for t in raw.replace(",", " ").split() if t.strip()]
     st.session_state.tickers = tickers
@@ -336,7 +360,6 @@ if run:
         try:
             all_rows.extend(screen_ticker(t))
         except Exception as e:
-            # Keep app alive; record an error row for that ticker
             all_rows.append({
                 "ticker": t, "pair": "—",
                 "exp1": "—", "dte1": "—", "iv1": "—",
@@ -354,32 +377,39 @@ if run:
     st.session_state.df = df
     st.session_state.last_run_ok = True
 
-# --- Controls and rendering live OUTSIDE the button block (so they don't clear the table) ---
+# --------- Render/sort outside the button block ---------
 df_current = st.session_state.df
 
 if df_current is None or df_current.empty:
     st.info("Enter tickers and click **Run Screener** to see results.")
 else:
-    # Sort controls always available; they won’t erase data on change
-    display_cols = [c for c in df_current.columns if c != "_tags"]
-    default_idx = display_cols.index("ff") if "ff" in display_cols else 0
+    # Sorting controls use friendly labels, but map back to real keys
+    display_labels = [DISPLAY_MAP[k] for k in DISPLAY_KEYS if k in df_current.columns]
+    default_label = DISPLAY_MAP["ff"] if "ff" in df_current.columns else display_labels[0]
 
-    col1, col2, col3 = st.columns([3, 1.2, 1.8], vertical_alignment="bottom")
-    with col1:
-        sort_col = st.selectbox("Sort by", options=display_cols, index=default_idx, key="sort_col")
-    with col2:
+    c1, c2, c3 = st.columns([3, 1.2, 1.8], vertical_alignment="bottom")
+    with c1:
+        sort_label = st.selectbox("Sort by", options=display_labels, index=display_labels.index(default_label), key="sort_col_label")
+    with c2:
         sort_ascending = st.toggle("Ascending", value=False, key="sort_asc")
-    with col3:
+    with c3:
         st.caption("Blanks always shown last")
 
-    # Safe sort (guard against missing col)
-    df_sorted = sort_df(df_current, sort_col, sort_ascending)
+    sort_key = LABEL_TO_KEY.get(sort_label, "ff")
+    df_sorted = sort_df(df_current, sort_key, sort_ascending)
 
-    # Row highlighting
-    def highlight(row: pd.Series):
-        tags = row.get("_tags", []) or []
-        earn = "earn" in tags
-        hot = "hot" in tags
+    # --- Build display df: drop _tags and rename headers ---
+    have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
+    df_display = df_sorted[have_keys].copy()
+    df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
+
+    # --- Row highlighting based on hidden _tags (kept in df_sorted) ---
+    tags_series = df_sorted["_tags"] if "_tags" in df_sorted.columns else pd.Series([[]]*len(df_sorted))
+
+    def _highlight_row(row: pd.Series):
+        tags = tags_series.iloc[row.name] if row.name < len(tags_series) else []
+        earn = isinstance(tags, (list, tuple, set)) and ("earn" in tags)
+        hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
         color = "#ffffff"
         if earn and hot:
             color = "#ffe0b2"   # both
@@ -390,8 +420,8 @@ else:
         return [f"background-color:{color}; color:#000000;"] * len(row)
 
     styled = (
-        df_sorted.style
-            .apply(highlight, axis=1)
+        df_display.style
+            .apply(_highlight_row, axis=1)
             .set_properties(**{"border": "1px solid #bbb", "color": "#000", "font-size": "14px"})
     )
 
@@ -408,7 +438,6 @@ else:
         unsafe_allow_html=True,
     )
 
-    # Use deterministic HTML to avoid widget recalc stomping display
     st.markdown(styled.to_html(), unsafe_allow_html=True)
     st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
 
