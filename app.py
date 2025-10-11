@@ -219,25 +219,43 @@ if st.button("Run Screener"):
         progress.progress(i / len(tickers), text=f"Scanning {t}…")
     progress.empty()
     df = pd.DataFrame(all_rows)
-
-    # Ensure column exists
     if "_tags" not in df.columns:
         df["_tags"] = [[] for _ in range(len(df))]
 
-    # --- color styling ---
     def highlight(row):
         earn = "earn" in row["_tags"]
         hot = "hot" in row["_tags"]
-        color = ""
+        color = "#ffffff"
         if earn and hot:
-            color = "#ffcc80"
+            color = "#ffe0b2"
         elif earn:
-            color = "#fff59d"
+            color = "#fff9c4"
         elif hot:
-            color = "#c8e6c9"
-        style = f'background-color:{color}'
-        return [style] * len(row)
+            color = "#dcedc8"
+        return [f"background-color:{color}; color:#000000;"] * len(row)
 
-    styled = df.style.apply(highlight, axis=1)
+    styled = (
+        df.style
+        .apply(highlight, axis=1)
+        .set_properties(**{"border": "1px solid #bbb", "color": "#000", "font-size": "14px"})
+    )
+
+    st.markdown(
+        """
+        <style>
+        table {border-collapse: collapse; width: 100%;}
+        th {position: sticky; top: 0; background-color: #f0f0f0; color: #000; font-weight: bold;}
+        tr:nth-child(even) {background-color: #fafafa;}
+        tr:hover {background-color: #e0e0e0;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.markdown(styled.to_html(), unsafe_allow_html=True)
     st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
+
+    st.markdown(
+        "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
+        unsafe_allow_html=True,
+    )
