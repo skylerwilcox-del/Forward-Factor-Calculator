@@ -8,9 +8,23 @@ import pytz
 import streamlit as st
 import yfinance as yf
 
+# =========================
+# App/session setup
+# =========================
 PACIFIC = pytz.timezone("America/Los_Angeles")
+st.set_page_config(page_title="Forward Vol Screener", layout="wide")
 
-# ---------- helpers ----------
+# Initialize session state containers once
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "tickers" not in st.session_state:
+    st.session_state.tickers = []
+if "last_run_ok" not in st.session_state:
+    st.session_state.last_run_ok = False
+
+# =========================
+# Helpers
+# =========================
 def _now_pacific_date() -> date:
     return datetime.now(PACIFIC).date()
 
@@ -45,7 +59,9 @@ def _expiry_to_date(expiry_iso: str) -> Optional[date]:
     except Exception:
         return None
 
-# ---------- yfinance ----------
+# =========================
+# yfinance (cached)
+# =========================
 @st.cache_data(ttl=600)
 def get_spot(ticker: str) -> Optional[float]:
     tk = yf.Ticker(ticker)
@@ -79,6 +95,7 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
                 return min(fut)
     except Exception:
         pass
+    # Fallback scrapes/fields
     for src in (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {})):
         if src is None:
             continue
@@ -94,13 +111,14 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
                 continue
     return None
 
-# ---------- calculations ----------
+# =========================
+# Calculations
+# =========================
 def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     calls, puts = get_chain(ticker, expiry)
     if calls.empty and puts.empty:
         return None
     strikes = pd.Index(sorted(set(calls["strike"]).union(set(puts["strike"]))))
-
     if len(strikes) == 0:
         return None
     atm = float(min(strikes, key=lambda s: abs(float(s) - spot)))
@@ -152,19 +170,29 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
     ff = None if fwd_sigma == 0 else (s1 - fwd_sigma) / fwd_sigma
     return fwd_sigma, ff
 
-# ---------- screener ----------
+# =========================
+# Screener
+# =========================
 def screen_ticker(ticker: str) -> List[Dict]:
     spot = get_spot(ticker)
     if spot is None:
-        return [{"ticker": ticker, "ff": "—", "pair": "—", "exp1": "—", "dte1": "—", "iv1": "—",
-                 "exp2": "—", "dte2": "—", "iv2": "—", "fwd_vol": "—", "cal_debit": "—",
-                 "earn_in_window": "—", "_tags": ["no_spot"]}]
+        return [{
+            "ticker": ticker, "pair": "—",
+            "exp1": "—", "dte1": "—", "iv1": "—",
+            "exp2": "—", "dte2": "—", "iv2": "—",
+            "fwd_vol": "—", "ff": "—", "cal_debit": "—",
+            "earn_in_window": "—", "_tags": ["no_spot"]
+        }]
 
     expiries = get_options(ticker)
     if not expiries:
-        return [{"ticker": ticker, "ff": "—", "pair": "—", "exp1": "—", "dte1": "—", "iv1": "—",
-                 "exp2": "—", "dte2": "—", "iv2": "—", "fwd_vol": "—", "cal_debit": "—",
-                 "earn_in_window": "—", "_tags": ["no_exp"]}]
+        return [{
+            "ticker": ticker, "pair": "—",
+            "exp1": "—", "dte1": "—", "iv1": "—",
+            "exp2": "—", "dte2": "—", "iv2": "—",
+            "fwd_vol": "—", "ff": "—", "cal_debit": "—",
+            "earn_in_window": "—", "_tags": ["no_exp"]
+        }]
 
     ed = [(e, _calc_dte(e)) for e in expiries]
     nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
@@ -183,7 +211,7 @@ def screen_ticker(ticker: str) -> List[Dict]:
         s1, s2 = iv1 / 100.0, iv2 / 100.0
         T1, T2 = dte1 / 365.0, dte2 / 365.0
         fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
-        strike, c1, c2, debit = calendar_debit(ticker, exp1, exp2, spot)
+        _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
 
         earn_txt, tags = "—", []
         if earn_dt:
@@ -206,94 +234,88 @@ def screen_ticker(ticker: str) -> List[Dict]:
         })
     return rows
 
-# ---------- robust, vectorized sorting ----------
+# =========================
+# Robust, vectorized sorting
+# =========================
 _BLANK_SET = {"", "-", "—", "–"}
 
 def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     """
-    Returns a DataFrame with three columns aligned to 'series':
-      _grp: 0 = non-blank, 1 = blank (blanks always go last)
-      _t  : type code inside non-blank rows: 0=numeric, 1=date, 2=text
-      _val: sortable value (float for numeric/date, lowercased string for text)
+    Build helper columns for safe sorting across mixed types.
+    _grp: 0=non-blank, 1=blank (blanks go last)
+    _t  : 0=numeric, 1=date, 2=text, 9=blank
+    _val: numeric value (float) or lowercased string
     """
     s = series.copy()
-
-    # Blank detection (handles None/NaN and dash glyphs)
     s_str = s.astype(str).str.strip()
     is_blank = s.isna() | s_str.isin(_BLANK_SET)
 
-    # Try numeric signals (priority: percent, currency, plain number)
-    # Percent: "12.34%"
-    pct_mask = s_str.str.endswith("%")
-    pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", ""), errors="coerce")
+    # Parse percent: "12.34%"
+    pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", "", regex=False), errors="coerce")
+    pct_mask = s_str.str.endswith("%") & ~pd.isna(pct_val)
 
-    # Currency: "$1,234.56" or "($1,234.56)"
+    # Parse currency: "$1,234.56" or "($1,234.56)"
     cur_mask = s_str.str.match(r"^\(?\$\s*[\d,]+(?:\.\d+)?\)?$")
-    cur_core = (
-        s_str.str.replace(r"^\(", "", regex=True)
-             .str.replace(r"\)$", "", regex=True)
-             .str.replace("$", "", regex=False)
-             .str.replace(",", "", regex=False)
-             .str.strip()
-    )
+    cur_core = (s_str
+                .str.replace(r"^\(", "", regex=True)
+                .str.replace(r"\)$", "", regex=True)
+                .str.replace("$", "", regex=False)
+                .str.replace(",", "", regex=False)
+                .str.strip())
     cur_val = pd.to_numeric(cur_core, errors="coerce")
     cur_neg = s_str.str.startswith("(") & s_str.str.endswith(")")
     cur_val = np.where(cur_neg, -cur_val, cur_val)
 
-    # Plain numbers (allow commas)
-    num_val = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
+    # Plain number (allow commas)
+    num_val_plain = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
 
-    # Combine numeric candidates (prefer pct > currency > plain)
-    num_key = np.where(~pd.isna(pct_val), pct_val, np.where(~pd.isna(cur_val), cur_val, num_val))
+    # Combine numeric preference: pct > currency > plain
+    num_key = np.where(~pd.isna(pct_val) & pct_mask, pct_val,
+              np.where(~pd.isna(cur_val) & cur_mask, cur_val, num_val_plain))
     num_key = pd.to_numeric(num_key, errors="coerce")
 
-    # Dates (ISO or anything pandas can parse)
+    # Dates (anything pandas can parse)
     dt = pd.to_datetime(s_str, errors="coerce", utc=True)
-    date_key = dt.view("int64")  # nanoseconds since epoch; NaT -> NaN
+    date_key = dt.view("int64")  # ns since epoch; NaT → NaN
 
-    # Text key (lowercased)
+    # Text fallback
     text_key = s_str.str.lower()
 
-    # Build type code
+    # Type selection
     is_num = ~pd.isna(num_key)
     is_date = pd.isna(num_key) & ~pd.isna(date_key)
     is_text = ~(is_num | is_date)
 
     t_code = np.select([is_num, is_date, is_text], [0, 1, 2], default=2)
 
-    # Value chosen by type (floats for num/date; strings for text)
+    # Value by type
     val = pd.Series(np.nan, index=s.index, dtype="object")
     val[is_num] = num_key[is_num]
-    # convert ns to ordinal-like float for consistent increasing date order
-    # (or keep nanoseconds int; both sort fine; use float for consistency)
     val[is_date] = date_key[is_date].astype("float64")
     val[is_text] = text_key[is_text]
 
-    # Group: blanks last
+    # Blanks last
     grp = np.where(is_blank, 1, 0)
-
-    # Force blanks to sort after everything: move blanks into a high group and neutral value
     t_code = np.where(is_blank, 9, t_code)
     val = np.where(is_blank, "", val)
 
     return pd.DataFrame({"_grp": grp, "_t": t_code, "_val": val}, index=s.index)
 
 def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
+    if df is None or df.empty or col not in df.columns:
+        return df
     aux = _build_sort_columns(df[col])
     out = (
         df.join(aux)
-          .sort_values(
-              by=["_grp", "_t", "_val"],
-              ascending=[True, True, ascending],
-              kind="mergesort"  # stable
-          )
+          .sort_values(by=["_grp", "_t", "_val"], ascending=[True, True, ascending], kind="mergesort")
           .drop(columns=["_grp", "_t", "_val"])
           .reset_index(drop=True)
     )
     return out
 
-# ---------- UI ----------
-st.set_page_config(page_title="Forward Vol Screener", layout="wide")
+# =========================
+# UI
+# =========================
 st.title("📈 Forward Volatility Screener")
 
 raw = st.text_area(
@@ -302,12 +324,26 @@ raw = st.text_area(
     height=100,
 )
 
-if st.button("Run Screener"):
+run = st.button("Run Screener")
+
+# Compute results only when button pressed; persist to session_state
+if run:
     tickers = [t.strip().upper() for t in raw.replace(",", " ").split() if t.strip()]
+    st.session_state.tickers = tickers
     progress = st.progress(0.0)
-    all_rows = []
+    all_rows: List[Dict] = []
     for i, t in enumerate(tickers, 1):
-        all_rows.extend(screen_ticker(t))
+        try:
+            all_rows.extend(screen_ticker(t))
+        except Exception as e:
+            # Keep app alive; record an error row for that ticker
+            all_rows.append({
+                "ticker": t, "pair": "—",
+                "exp1": "—", "dte1": "—", "iv1": "—",
+                "exp2": "—", "dte2": "—", "iv2": "—",
+                "fwd_vol": "—", "ff": "—", "cal_debit": "—",
+                "earn_in_window": "—", "_tags": [f"error:{type(e).__name__}"]
+            })
         progress.progress(i / len(tickers), text=f"Scanning {t}…")
     progress.empty()
 
@@ -315,22 +351,31 @@ if st.button("Run Screener"):
     if "_tags" not in df.columns:
         df["_tags"] = [[] for _ in range(len(df))]
 
-    # ----- sort controls -----
-    display_cols = [c for c in df.columns if c != "_tags"]
+    st.session_state.df = df
+    st.session_state.last_run_ok = True
+
+# --- Controls and rendering live OUTSIDE the button block (so they don't clear the table) ---
+df_current = st.session_state.df
+
+if df_current is None or df_current.empty:
+    st.info("Enter tickers and click **Run Screener** to see results.")
+else:
+    # Sort controls always available; they won’t erase data on change
+    display_cols = [c for c in df_current.columns if c != "_tags"]
     default_idx = display_cols.index("ff") if "ff" in display_cols else 0
-    col1, col2, col3 = st.columns([3, 2, 1.2], vertical_alignment="bottom")
+
+    col1, col2, col3 = st.columns([3, 1.2, 1.8], vertical_alignment="bottom")
     with col1:
-        sort_col = st.selectbox("Sort by", options=display_cols, index=default_idx)
+        sort_col = st.selectbox("Sort by", options=display_cols, index=default_idx, key="sort_col")
     with col2:
-        sort_ascending = st.toggle("Ascending", value=False)
+        sort_ascending = st.toggle("Ascending", value=False, key="sort_asc")
     with col3:
-        st.write("")  # spacer
-        st.write("")  # spacer
-        st.caption("Blanks always last")
+        st.caption("Blanks always shown last")
 
-    df = sort_df(df, sort_col, sort_ascending)
+    # Safe sort (guard against missing col)
+    df_sorted = sort_df(df_current, sort_col, sort_ascending)
 
-    # --- color styling ---
+    # Row highlighting
     def highlight(row: pd.Series):
         tags = row.get("_tags", []) or []
         earn = "earn" in tags
@@ -342,12 +387,12 @@ if st.button("Run Screener"):
             color = "#fff9c4"   # earnings
         elif hot:
             color = "#dcedc8"   # hot
-        return [f"background-color:{color}; color:#000000;"] * (len(row) - 0)
+        return [f"background-color:{color}; color:#000000;"] * len(row)
 
     styled = (
-        df.style
-          .apply(highlight, axis=1)
-          .set_properties(**{"border": "1px solid #bbb", "color": "#000", "font-size": "14px"})
+        df_sorted.style
+            .apply(highlight, axis=1)
+            .set_properties(**{"border": "1px solid #bbb", "color": "#000", "font-size": "14px"})
     )
 
     # Readable table (sticky header + zebra stripes)
@@ -363,6 +408,7 @@ if st.button("Run Screener"):
         unsafe_allow_html=True,
     )
 
+    # Use deterministic HTML to avoid widget recalc stomping display
     st.markdown(styled.to_html(), unsafe_allow_html=True)
     st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
 
