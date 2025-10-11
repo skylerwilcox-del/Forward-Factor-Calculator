@@ -1,7 +1,8 @@
 import math
 from datetime import datetime, date
-from typing import Optional, Tuple, List, Set, Dict
+from typing import Optional, Tuple, List, Dict
 
+import numpy as np
 import pandas as pd
 import pytz
 import streamlit as st
@@ -99,6 +100,7 @@ def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     if calls.empty and puts.empty:
         return None
     strikes = pd.Index(sorted(set(calls["strike"]).union(set(puts["strike"]))))
+
     if len(strikes) == 0:
         return None
     atm = float(min(strikes, key=lambda s: abs(float(s) - spot)))
@@ -154,14 +156,18 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
 def screen_ticker(ticker: str) -> List[Dict]:
     spot = get_spot(ticker)
     if spot is None:
-        return [{"ticker": ticker, "ff": "No spot"}]
+        return [{"ticker": ticker, "ff": "—", "pair": "—", "exp1": "—", "dte1": "—", "iv1": "—",
+                 "exp2": "—", "dte2": "—", "iv2": "—", "fwd_vol": "—", "cal_debit": "—",
+                 "earn_in_window": "—", "_tags": ["no_spot"]}]
 
     expiries = get_options(ticker)
     if not expiries:
-        return [{"ticker": ticker, "ff": "No expirations"}]
+        return [{"ticker": ticker, "ff": "—", "pair": "—", "exp1": "—", "dte1": "—", "iv1": "—",
+                 "exp2": "—", "dte2": "—", "iv2": "—", "fwd_vol": "—", "cal_debit": "—",
+                 "earn_in_window": "—", "_tags": ["no_exp"]}]
 
     ed = [(e, _calc_dte(e)) for e in expiries]
-    nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t))
+    nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
     e30, e60, e90 = nearest(30), nearest(60), nearest(90)
     pairs = []
     if e30 and e60 and e60[1] > e30[1]: pairs.append(("30–60", e30, e60))
@@ -193,84 +199,98 @@ def screen_ticker(ticker: str) -> List[Dict]:
             "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%",
             "exp2": exp2, "dte2": dte2, "iv2": f"{iv2:.2f}%",
             "fwd_vol": f"{(fwd_sigma*100):.2f}%" if fwd_sigma else "—",
-            "ff": f"{(ff*100):.2f}%" if ff else "—",
-            "cal_debit": f"{debit:.2f}" if debit else "—",
+            "ff": f"{(ff*100):.2f}%" if ff is not None else "—",
+            "cal_debit": f"{debit:.2f}" if debit is not None else "—",
             "earn_in_window": earn_txt,
             "_tags": tags,
         })
     return rows
 
-# ---------- sorting helpers (works with %, $, dates, blanks) ----------
-# ---------- sorting helpers (robust to NaN, %, $, dates, blanks) ----------
-def _sort_key(value):
-    # Treat None/NaN/placeholder dashes as blanks that should sort last
-    if value is None or pd.isna(value):
-        return (1, None)
+# ---------- robust, vectorized sorting ----------
+_BLANK_SET = {"", "-", "—", "–"}
 
-    # Normalize common "blank" glyphs
-    if isinstance(value, str):
-        s = value.strip()
-        if s in {"", "-", "—", "–"}:
-            return (1, None)
-    else:
-        s = str(value).strip()
+def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
+    """
+    Returns a DataFrame with three columns aligned to 'series':
+      _grp: 0 = non-blank, 1 = blank (blanks always go last)
+      _t  : type code inside non-blank rows: 0=numeric, 1=date, 2=text
+      _val: sortable value (float for numeric/date, lowercased string for text)
+    """
+    s = series.copy()
 
-    # Numbers already as numeric
-    if isinstance(value, (int, float)) and not math.isnan(value):
-        return (0, float(value))
+    # Blank detection (handles None/NaN and dash glyphs)
+    s_str = s.astype(str).str.strip()
+    is_blank = s.isna() | s_str.isin(_BLANK_SET)
 
-    # Dates / timestamps
-    if isinstance(value, (pd.Timestamp, datetime, date)):
-        # Use ordinal to keep it sortable and comparable
-        d = pd.to_datetime(value, errors="coerce")
-        return (0, int(d.toordinal())) if pd.notna(d) else (1, None)
+    # Try numeric signals (priority: percent, currency, plain number)
+    # Percent: "12.34%"
+    pct_mask = s_str.str.endswith("%")
+    pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", ""), errors="coerce")
 
-    # Strings: handle %, $, commas, parentheses-negatives, ISO dates, then fallback
-    s_lower = s.lower()
+    # Currency: "$1,234.56" or "($1,234.56)"
+    cur_mask = s_str.str.match(r"^\(?\$\s*[\d,]+(?:\.\d+)?\)?$")
+    cur_core = (
+        s_str.str.replace(r"^\(", "", regex=True)
+             .str.replace(r"\)$", "", regex=True)
+             .str.replace("$", "", regex=False)
+             .str.replace(",", "", regex=False)
+             .str.strip()
+    )
+    cur_val = pd.to_numeric(cur_core, errors="coerce")
+    cur_neg = s_str.str.startswith("(") & s_str.str.endswith(")")
+    cur_val = np.where(cur_neg, -cur_val, cur_val)
 
-    # Percentages like "12.34%"
-    if s.endswith("%"):
-        try:
-            return (0, float(s[:-1].replace(",", "")))
-        except Exception:
-            pass
+    # Plain numbers (allow commas)
+    num_val = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
 
-    # Currency like "$1,234.56" or "($1,234.56)"
-    if s.startswith("$") or (s.startswith("(") and s.endswith(")") and "$" in s):
-        try:
-            neg = s.startswith("(") and s.endswith(")")
-            core = s.replace("$", "").replace(",", "").replace("(", "").replace(")", "")
-            val = float(core)
-            return (0, -val if neg else val)
-        except Exception:
-            pass
+    # Combine numeric candidates (prefer pct > currency > plain)
+    num_key = np.where(~pd.isna(pct_val), pct_val, np.where(~pd.isna(cur_val), cur_val, num_val))
+    num_key = pd.to_numeric(num_key, errors="coerce")
 
-    # Plain number string (with commas allowed)
-    try:
-        return (0, float(s.replace(",", "")))
-    except Exception:
-        pass
+    # Dates (ISO or anything pandas can parse)
+    dt = pd.to_datetime(s_str, errors="coerce", utc=True)
+    date_key = dt.view("int64")  # nanoseconds since epoch; NaT -> NaN
 
-    # ISO date like "2025-10-11" (or anything pandas can safely parse)
-    d = pd.to_datetime(s, errors="coerce", utc=True)
-    if pd.notna(d):
-        return (0, int(d.toordinal()))
+    # Text key (lowercased)
+    text_key = s_str.str.lower()
 
-    # Fallback to case-insensitive text
-    return (0, s_lower)
+    # Build type code
+    is_num = ~pd.isna(num_key)
+    is_date = pd.isna(num_key) & ~pd.isna(date_key)
+    is_text = ~(is_num | is_date)
 
+    t_code = np.select([is_num, is_date, is_text], [0, 1, 2], default=2)
+
+    # Value chosen by type (floats for num/date; strings for text)
+    val = pd.Series(np.nan, index=s.index, dtype="object")
+    val[is_num] = num_key[is_num]
+    # convert ns to ordinal-like float for consistent increasing date order
+    # (or keep nanoseconds int; both sort fine; use float for consistency)
+    val[is_date] = date_key[is_date].astype("float64")
+    val[is_text] = text_key[is_text]
+
+    # Group: blanks last
+    grp = np.where(is_blank, 1, 0)
+
+    # Force blanks to sort after everything: move blanks into a high group and neutral value
+    t_code = np.where(is_blank, 9, t_code)
+    val = np.where(is_blank, "", val)
+
+    return pd.DataFrame({"_grp": grp, "_t": t_code, "_val": val}, index=s.index)
 
 def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
-    # Build grouping/key columns in one pass (avoid zip(*) pitfalls if col is empty)
-    keys = df[col].map(_sort_key)
-    df = df.assign(
-        _grp=[k[0] for k in keys],
-        _key=[k[1] for k in keys],
+    aux = _build_sort_columns(df[col])
+    out = (
+        df.join(aux)
+          .sort_values(
+              by=["_grp", "_t", "_val"],
+              ascending=[True, True, ascending],
+              kind="mergesort"  # stable
+          )
+          .drop(columns=["_grp", "_t", "_val"])
+          .reset_index(drop=True)
     )
-    # Non-blanks (_grp=0) always first; then chosen direction on the key
-    out = df.sort_values(by=["_grp", "_key"], ascending=[True, ascending], kind="mergesort")
-    return out.drop(columns=["_grp", "_key"])
-
+    return out
 
 # ---------- UI ----------
 st.set_page_config(page_title="Forward Vol Screener", layout="wide")
@@ -290,23 +310,31 @@ if st.button("Run Screener"):
         all_rows.extend(screen_ticker(t))
         progress.progress(i / len(tickers), text=f"Scanning {t}…")
     progress.empty()
+
     df = pd.DataFrame(all_rows)
     if "_tags" not in df.columns:
         df["_tags"] = [[] for _ in range(len(df))]
 
-    # ----- sort controls (restore sorting feature) -----
+    # ----- sort controls -----
     display_cols = [c for c in df.columns if c != "_tags"]
-    left, right = st.columns([3, 1])
-    with left:
-        sort_col = st.selectbox("Sort by", options=display_cols, index=display_cols.index("ff") if "ff" in display_cols else 0)
-    with right:
+    default_idx = display_cols.index("ff") if "ff" in display_cols else 0
+    col1, col2, col3 = st.columns([3, 2, 1.2], vertical_alignment="bottom")
+    with col1:
+        sort_col = st.selectbox("Sort by", options=display_cols, index=default_idx)
+    with col2:
         sort_ascending = st.toggle("Ascending", value=False)
+    with col3:
+        st.write("")  # spacer
+        st.write("")  # spacer
+        st.caption("Blanks always last")
+
     df = sort_df(df, sort_col, sort_ascending)
 
     # --- color styling ---
-    def highlight(row):
-        earn = "earn" in row["_tags"]
-        hot = "hot" in row["_tags"]
+    def highlight(row: pd.Series):
+        tags = row.get("_tags", []) or []
+        earn = "earn" in tags
+        hot = "hot" in tags
         color = "#ffffff"
         if earn and hot:
             color = "#ffe0b2"   # both
@@ -314,15 +342,15 @@ if st.button("Run Screener"):
             color = "#fff9c4"   # earnings
         elif hot:
             color = "#dcedc8"   # hot
-        return [f"background-color:{color}; color:#000000;"] * len(row)
+        return [f"background-color:{color}; color:#000000;"] * (len(row) - 0)
 
     styled = (
         df.style
-        .apply(highlight, axis=1)
-        .set_properties(**{"border": "1px solid #bbb", "color": "#000", "font-size": "14px"})
+          .apply(highlight, axis=1)
+          .set_properties(**{"border": "1px solid #bbb", "color": "#000", "font-size": "14px"})
     )
 
-    # readable table (sticky header + zebra stripes)
+    # Readable table (sticky header + zebra stripes)
     st.markdown(
         """
         <style>
