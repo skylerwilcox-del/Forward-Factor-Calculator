@@ -222,18 +222,29 @@ if st.button("Run Screener"):
     progress.empty()
     df = pd.DataFrame(all_rows).drop(columns=["_tags"], errors="ignore")
 
-    # --- coloring ---
-    def row_color(row):
+        # --- coloring ---
+    def color_row(row):
         earn = "earn" in row.get("_tags", [])
         hot = "hot" in row.get("_tags", [])
         if earn and hot:
-            return "background-color: #ffdb99"
+            return "#ffcc80"   # orange
         if earn:
-            return "background-color: #fff3b0"
+            return "#fff59d"   # yellow
         if hot:
-            return "background-color: #d7ffd9"
-        return ""
+            return "#c8e6c9"   # green
+        return "white"
 
-    styled = df.style.apply(lambda r: [row_color(r)] * len(r), axis=1)
-    st.dataframe(styled, use_container_width=True)
-    st.caption("🟩 FF ≥ 0.20 🔶 Earnings within window  🟧 Both conditions true")
+    df["row_color"] = df.apply(color_row, axis=1)
+
+    st.data_editor(
+        df.drop(columns=["_tags"]),
+        hide_index=True,
+        use_container_width=True,
+        column_order=["ticker", "pair", "exp1", "dte1", "iv1", "exp2", "dte2", "iv2", "fwd_vol", "ff", "cal_debit", "earn_in_window"],
+        column_config={},
+        key="screen_table",
+        disabled=True,
+        height=600,
+        row_styles=df["row_color"].apply(lambda c: {"backgroundColor": c}).to_list(),
+    )
+    st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
