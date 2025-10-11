@@ -220,31 +220,24 @@ if st.button("Run Screener"):
     progress.empty()
     df = pd.DataFrame(all_rows)
 
-    # --- Safe drop + coloring ---
+    # Ensure column exists
     if "_tags" not in df.columns:
         df["_tags"] = [[] for _ in range(len(df))]
 
-    def color_row(row):
+    # --- color styling ---
+    def highlight(row):
         earn = "earn" in row["_tags"]
         hot = "hot" in row["_tags"]
+        color = ""
         if earn and hot:
-            return "#ffcc80"  # orange
-        if earn:
-            return "#fff59d"  # yellow
-        if hot:
-            return "#c8e6c9"  # green
-        return "white"
+            color = "#ffcc80"
+        elif earn:
+            color = "#fff59d"
+        elif hot:
+            color = "#c8e6c9"
+        style = f'background-color:{color}'
+        return [style] * len(row)
 
-    df["row_color"] = df.apply(color_row, axis=1)
-
-    # Use data_editor for live coloring
-    st.data_editor(
-        df.drop(columns=["_tags"], errors="ignore"),
-        hide_index=True,
-        use_container_width=True,
-        disabled=True,
-        height=600,
-        key="screen_table",
-        row_styles=df["row_color"].apply(lambda c: {"backgroundColor": c}).to_list(),
-    )
+    styled = df.style.apply(highlight, axis=1)
+    st.markdown(styled.to_html(), unsafe_allow_html=True)
     st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
