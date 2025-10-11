@@ -201,38 +201,76 @@ def screen_ticker(ticker: str) -> List[Dict]:
     return rows
 
 # ---------- sorting helpers (works with %, $, dates, blanks) ----------
+# ---------- sorting helpers (robust to NaN, %, $, dates, blanks) ----------
 def _sort_key(value):
-    if value in (None, "—", "-", ""):
+    # Treat None/NaN/placeholder dashes as blanks that should sort last
+    if value is None or pd.isna(value):
         return (1, None)
-    s = str(value).strip()
+
+    # Normalize common "blank" glyphs
+    if isinstance(value, str):
+        s = value.strip()
+        if s in {"", "-", "—", "–"}:
+            return (1, None)
+    else:
+        s = str(value).strip()
+
+    # Numbers already as numeric
+    if isinstance(value, (int, float)) and not math.isnan(value):
+        return (0, float(value))
+
+    # Dates / timestamps
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        # Use ordinal to keep it sortable and comparable
+        d = pd.to_datetime(value, errors="coerce")
+        return (0, int(d.toordinal())) if pd.notna(d) else (1, None)
+
+    # Strings: handle %, $, commas, parentheses-negatives, ISO dates, then fallback
+    s_lower = s.lower()
+
+    # Percentages like "12.34%"
     if s.endswith("%"):
         try:
-            return (0, float(s[:-1]))
+            return (0, float(s[:-1].replace(",", "")))
         except Exception:
-            return (0, s.lower())
-    if s.startswith("$"):
+            pass
+
+    # Currency like "$1,234.56" or "($1,234.56)"
+    if s.startswith("$") or (s.startswith("(") and s.endswith(")") and "$" in s):
         try:
-            return (0, float(s[1:]))
+            neg = s.startswith("(") and s.endswith(")")
+            core = s.replace("$", "").replace(",", "").replace("(", "").replace(")", "")
+            val = float(core)
+            return (0, -val if neg else val)
         except Exception:
-            return (0, s.lower())
+            pass
+
+    # Plain number string (with commas allowed)
     try:
-        return (0, float(s))
+        return (0, float(s.replace(",", "")))
     except Exception:
         pass
-    if len(s) == 10 and s[4:5] == "-" and s[7:8] == "-":
-        try:
-            y, m, d = map(int, s.split("-"))
-            return (0, (y, m, d))
-        except Exception:
-            return (0, s.lower())
-    return (0, s.lower())
+
+    # ISO date like "2025-10-11" (or anything pandas can safely parse)
+    d = pd.to_datetime(s, errors="coerce", utc=True)
+    if pd.notna(d):
+        return (0, int(d.toordinal()))
+
+    # Fallback to case-insensitive text
+    return (0, s_lower)
+
 
 def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
-    grp, key = zip(*df[col].map(_sort_key))
-    df = df.assign(_grp=list(grp), _key=list(key))
-    # Always put non-blanks first (_grp=0), then apply asc/desc on key
-    df = df.sort_values(by=["_grp", "_key"], ascending=[True, ascending], kind="mergesort")
-    return df.drop(columns=["_grp", "_key"])
+    # Build grouping/key columns in one pass (avoid zip(*) pitfalls if col is empty)
+    keys = df[col].map(_sort_key)
+    df = df.assign(
+        _grp=[k[0] for k in keys],
+        _key=[k[1] for k in keys],
+    )
+    # Non-blanks (_grp=0) always first; then chosen direction on the key
+    out = df.sort_values(by=["_grp", "_key"], ascending=[True, ascending], kind="mergesort")
+    return out.drop(columns=["_grp", "_key"])
+
 
 # ---------- UI ----------
 st.set_page_config(page_title="Forward Vol Screener", layout="wide")
