@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =========================
 PACIFIC = pytz.timezone("America/Los_Angeles")
 EASTERN = pytz.timezone("America/New_York")
-st.set_page_config(page_title="Forward Vol Screener — Top 27 (All US Stocks)", layout="wide")
+st.set_page_config(page_title="Forward Vol Screener — Top 27 (3M Avg Vol, All US Stocks)", layout="wide")
 
 # Persistent session state
 st.session_state.setdefault("df", None)
@@ -26,23 +26,21 @@ st.session_state.setdefault("trigger_run", False)
 # --- Config ---
 TOP_STOCKS = 27
 ADD_ETFS = True
-FIXED_ETFS = ["VOO", "SPY", "QQQ"]
+FIXED_ETFS = ["SPY", "QQQ", "VOO"]
 MAX_WORKERS = 12
 
-# Download tuning (smaller blocks = fewer partial/empty returns from yfinance)
-DL_CHUNK_STAGE1 = 30
-DL_CHUNK_STAGE2 = 20
-SHORTLIST_SIZE = 500
+# Download tuning
+DL_CHUNK_STAGE1 = 40     # batch for quick latest volume
+SHORTLIST_SIZE = 800     # shortlist before 3m avg ranking (perf win)
 
-# Large liquid fallback universe (100+)
+# Large liquid fallback universe (in case yfinance symbol fetch fails)
 FALLBACK_LIQUID = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","AMD","NFLX","CRM","COST","PEP","ADBE","INTC",
     "UBER","QCOM","AMAT","TSM","ORCL","PFE","MRK","JNJ","LLY","V","MA","JPM","BAC","WFC","C","GS","MS","SCHW","BLK",
-    "GE","HON","CAT","BA","NKE","KO","PEP","PG","MCD","WMT","HD","LOW","TGT","DIS","CMCSA","T","VZ","TMUS","CSCO",
+    "GE","HON","CAT","BA","NKE","KO","PG","MCD","WMT","HD","LOW","TGT","DIS","CMCSA","T","VZ","TMUS","CSCO",
     "PANW","NOW","SNOW","DDOG","NET","MDB","ZS","PLTR","SHOP","ABNB","PYPL","SQ","ROKU","TTD","SPOT","DKNG","RBLX",
     "MU","NXPI","TXN","ADI","ON","LRCX","KLAC","ASML","BABA","BIDU","PDD","RIO","BHP","CVX","XOM","COP","OXY","SLB",
-    "F","GM","RIVN","LCID","NIO","CCL","AAL","UAL","DAL","UPS","FDX","SOFI","COIN","HOOD","GME","BBBYQ",  # if delisted returns empty, our guards skip
-    "TQQQ","SQQQ","QQQ","SPY","VOO"  # ETFs may show up; okay—we de-dup later and still add fixed ETFs
+    "F","GM","RIVN","LCID","NIO","CCL","AAL","UAL","DAL","UPS","FDX","SOFI","COIN","HOOD","GME"
 ]
 
 # =========================
@@ -95,63 +93,12 @@ def _is_clean_us_symbol(sym: str) -> bool:
     # Allow up to 5 letters/digits (+ optional hyphen suffix). Skip indexes/OTC prefixed weirdness.
     return bool(re.fullmatch(r"[A-Z0-9]{1,5}(-[A-Z0-9]{1,2})?", sym))
 
+def _chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
 # =========================
 # yfinance (cached)
-# =========================
-@st.cache_data(ttl=600, show_spinner=False)
-def get_spot(ticker: str) -> Optional[float]:
-    tk = yf.Ticker(ticker)
-    spot = tk.fast_info.get("last_price") or tk.info.get("regularMarketPrice")
-    if spot is None:
-        px = tk.history(period="1d")
-        if not px.empty:
-            spot = float(px["Close"].iloc[-1])
-    return _first_float(spot)
-
-@st.cache_data(ttl=600, show_spinner=False)
-def get_options(ticker: str) -> List[str]:
-    try:
-        opts = yf.Ticker(ticker).options or []
-        return [e for e in opts if isinstance(e, str) and len(e) == 10 and e[4] == "-" and e[7] == "-"]
-    except Exception:
-        return []
-
-@st.cache_data(ttl=600, show_spinner=False)
-def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    oc = yf.Ticker(ticker).option_chain(expiry)
-    return oc.calls.copy(), oc.puts.copy()
-
-@st.cache_data(ttl=600, show_spinner=False)
-def get_next_earnings_date(ticker: str) -> Optional[date]:
-    today = _now_pacific_date()
-    tk = yf.Ticker(ticker)
-    try:
-        df = tk.get_earnings_dates(limit=8)
-        if df is not None and not df.empty:
-            col = "Earnings Date" if "Earnings Date" in df.columns else df.columns[0]
-            dates = pd.to_datetime(df[col], utc=True, errors="coerce").dt.date
-            fut = [d for d in dates if d and d >= today]
-            if fut:
-                return min(fut)
-    except Exception:
-        pass
-    for src in (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {})):
-        if src is None:
-            continue
-        for key in ("Earnings Date", "earningsDate", "earnings_date", "nextEarningsDate"):
-            try:
-                val = src[key] if isinstance(src, dict) else src.loc[key].values
-                if isinstance(val, (list, tuple, pd.Series, pd.Index)):
-                    val = val[0]
-                d = pd.to_datetime(val, utc=True, errors="coerce")
-                if pd.notna(d) and d.date() >= today:
-                    return d.date()
-            except Exception:
-                continue
-    return None
-
-# =========================
-# Universe & downloads
 # =========================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_us_stock_universe() -> List[str]:
@@ -186,21 +133,7 @@ def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
         df = df[df["et_date"] < today_et]
     return df
 
-def _avg5(vol: pd.Series) -> Optional[float]:
-    vols = vol.dropna()
-    last5 = vols.tail(5)
-    if len(last5) >= 5:
-        return float(last5.mean())
-    # relax to last 3 if fewer than 5 sessions available
-    last3 = vols.tail(3)
-    if len(last3) >= 3:
-        return float(last3.mean())
-    return None
-
-def _chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
+@st.cache_data(ttl=1200, show_spinner=False)
 def _safe_multi_download(tickers, period, interval):
     if not tickers:
         return pd.DataFrame()
@@ -217,183 +150,217 @@ def _safe_multi_download(tickers, period, interval):
     except Exception:
         return pd.DataFrame()
 
+@st.cache_data(ttl=1200, show_spinner=False)
 def _safe_single_download(ticker, period, interval):
     try:
         return yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
     except Exception:
         return pd.DataFrame()
 
-# ---------- Two-stage ranker ----------
-def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: bool,
-                                    update_stage1=None, update_stage2=None) -> pd.DataFrame:
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_spot(ticker: str) -> Optional[float]:
+    tk = yf.Ticker(ticker)
+    spot = tk.fast_info.get("last_price") or tk.info.get("regularMarketPrice")
+    if spot is None:
+        px = tk.history(period="1d")
+        if not px.empty:
+            spot = float(px["Close"].iloc[-1])
+    return _first_float(spot)
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def get_options(ticker: str) -> List[str]:
+    try:
+        opts = yf.Ticker(ticker).options or []
+        return [e for e in opts if isinstance(e, str) and len(e) == 10 and e[4] == "-" and e[7] == "-"]
+    except Exception:
+        return []
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    oc = yf.Ticker(ticker).option_chain(expiry)
+    return oc.calls.copy(), oc.puts.copy()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_next_earnings_date(ticker: str) -> Optional[date]:
+    today = _now_pacific_date()
+    tk = yf.Ticker(ticker)
+    try:
+        df = tk.get_earnings_dates(limit=8)
+        if df is not None and not df.empty:
+            col = "Earnings Date" if "Earnings Date" in df.columns else df.columns[0]
+            dates = pd.to_datetime(df[col], utc=True, errors="coerce").dt.date
+            fut = [d for d in dates if d and d >= today]
+            if fut:
+                return min(fut)
+    except Exception:
+        pass
+    for src in (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {})):
+        if src is None:
+            continue
+        for key in ("Earnings Date", "earningsDate", "earnings_date", "nextEarningsDate"):
+            try:
+                val = src[key] if isinstance(src, dict) else src.loc[key].values
+                if isinstance(val, (list, tuple, pd.Series, pd.Index)):
+                    val = val[0]
+                d = pd.to_datetime(val, utc=True, errors="coerce")
+                if pd.notna(d) and d.date() >= today:
+                    return d.date()
+            except Exception:
+                continue
+    return None
+
+# =========================
+# Ranking: Top 27 by 3M Avg Volume (+ ETFs)
+# =========================
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_avg_volume_3mo(ticker: str) -> Optional[float]:
+    """Average daily volume over the last 3 months (exclude today's partial)."""
+    try:
+        df = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=False)
+        if df.empty or "Volume" not in df.columns:
+            return None
+        df = _exclude_today_if_open(df)
+        vols = df["Volume"].dropna()
+        if len(vols) == 0:
+            return None
+        return float(vols.mean())
+    except Exception:
+        return None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_last_close(ticker: str) -> Optional[float]:
+    try:
+        info = yf.Ticker(ticker).fast_info
+        px = info.get("last_price") or info.get("regularMarketPrice")
+        if px is not None:
+            return float(px)
+        df = yf.download(ticker, period="5d", interval="1d", progress=False)
+        if not df.empty and "Close" in df.columns:
+            return float(df["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def rank_top27_by_3m_avg_with_etfs(extras: List[str], shortlist_size: int = SHORTLIST_SIZE) -> pd.DataFrame:
+    """
+    Efficient 2-stage ranking:
+      Stage 1: quick latest volume over 7d (batched) to shortlist universe
+      Stage 2: compute true 3m avg only for shortlist, then pick Top 27 and append ETFs
+    """
     universe = get_us_stock_universe()
+    # add manual extras
     for e in extras:
         e = e.strip().upper()
         if _is_clean_us_symbol(e) and e not in universe:
             universe.append(e)
 
-    # Stage 1 — shortlist by last session volume
+    # Stage 1 — latest volume to shortlist
     stage1_rows = []
     processed = 0
     total = len(universe)
-
     for block in _chunks(universe, DL_CHUNK_STAGE1):
         data = _safe_multi_download(block, period="7d", interval="1d")
 
+        # Identify which symbols we have in the multi-index result
         got = []
         if isinstance(getattr(data, "columns", None), pd.MultiIndex):
             got = [c[0] for c in data.columns.unique(level=0)]
         elif isinstance(data, pd.DataFrame) and not data.empty:
-            # odd case: yfinance returned single-frame for one symbol → assume whole block failed, fall back per-ticker
+            # single symbol case - treat as block failure for consistency
             got = []
 
-        # Per-ticker fallback for any missing names in the block
+        # Fallback download for misses
         missing = set(block) - set(got)
+        single_store = {}
         for t in list(missing):
             sub = _safe_single_download(t, period="7d", interval="1d")
             if not sub.empty:
-                # emulate multi-index access path
-                if isinstance(getattr(data, "columns", None), pd.MultiIndex):
-                    data[(t, "Open")] = np.nan  # just to ensure t appears (we won't use Open)
+                single_store[t] = sub
                 got.append(t)
-                # attach a dict entry for reading below
-                if not hasattr(data, "_single_store"):
-                    data._single_store = {}
-                data._single_store[t] = sub
 
         for t in got:
             try:
-                if hasattr(data, "_single_store") and t in data._single_store:
-                    sub = data._single_store[t]
+                if t in single_store:
+                    sub = single_store[t]
                 else:
                     sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
                 if sub is None or sub.empty or "Volume" not in sub.columns:
                     continue
                 sub = _exclude_today_if_open(sub)
-                if "Volume" not in sub.columns or sub["Volume"].dropna().empty:
+                vol_series = sub["Volume"].dropna()
+                if vol_series.empty:
                     continue
-                last_vol = float(sub["Volume"].dropna().iloc[-1])
+                last_vol = float(vol_series.iloc[-1])
                 last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
                 stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
             except Exception:
                 continue
 
         processed += len(block)
-        if callable(update_stage1):
-            update_stage1(processed, total)
 
-    # If still empty, build Stage 1 from FALLBACK_LIQUID (per-ticker)
     if not stage1_rows:
+        # fallback using predefined liquid list
         for t in FALLBACK_LIQUID:
             sub = _safe_single_download(t, period="7d", interval="1d")
             if sub is None or sub.empty or "Volume" not in sub.columns:
                 continue
             sub = _exclude_today_if_open(sub)
-            if sub["Volume"].dropna().empty:
+            vol_series = sub["Volume"].dropna()
+            if vol_series.empty:
                 continue
-            last_vol = float(sub["Volume"].dropna().iloc[-1])
+            last_vol = float(vol_series.iloc[-1])
             last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
             stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
 
     if not stage1_rows:
-        # show ETFs at least
-        etf_rows = []
-        for etf in FIXED_ETFS:
-            hist = _safe_single_download(etf, period="20d", interval="1d")
-            hist = _exclude_today_if_open(hist)
-            avgv = _avg5(hist["Volume"]) if "Volume" in hist.columns else None
-            last_close = float(hist["Close"].dropna().iloc[-1]) if "Close" in hist.columns and not hist["Close"].dropna().empty else None
-            etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
-        return pd.DataFrame(etf_rows)
+        return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close","source"])
 
     stage1 = pd.DataFrame(stage1_rows).dropna(subset=["last_vol"]).sort_values("last_vol", ascending=False)
-    shortlist = stage1["ticker"].head(SHORTLIST_SIZE).tolist()
+    shortlist = stage1["ticker"].head(shortlist_size).tolist()
 
-    # Stage 2 — accurate avg over last 5 (or 3) sessions
-    stage2_rows = []
-    processed = 0
-    total2 = len(shortlist)
+    # Stage 2 — accurate 3m average on shortlist (multithreaded)
+    results = []
+    def fetch_3m(t):
+        return {
+            "ticker": t,
+            "avg_vol_3m": get_avg_volume_3mo(t),
+            "last_close": get_last_close(t)
+        }
 
-    for block in _chunks(shortlist, DL_CHUNK_STAGE2):
-        data = _safe_multi_download(block, period="20d", interval="1d")
-
-        got = []
-        if isinstance(getattr(data, "columns", None), pd.MultiIndex):
-            got = [c[0] for c in data.columns.unique(level=0)]
-
-        missing = set(block) - set(got)
-        for t in list(missing):
-            sub = _safe_single_download(t, period="20d", interval="1d")
-            if not sub.empty:
-                if isinstance(getattr(data, "columns", None), pd.MultiIndex):
-                    data[(t, "Open")] = np.nan
-                got.append(t)
-                if not hasattr(data, "_single_store"):
-                    data._single_store = {}
-                data._single_store[t] = sub
-
-        for t in got:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(fetch_3m, t): t for t in shortlist}
+        for fut in as_completed(futs):
             try:
-                if hasattr(data, "_single_store") and t in data._single_store:
-                    sub = data._single_store[t]
-                else:
-                    sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
-                if sub is None or sub.empty or "Volume" not in sub.columns:
-                    continue
-                sub = _exclude_today_if_open(sub)
-                avgv = _avg5(sub["Volume"])
-                if avgv is None:
-                    continue
-                last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
-                stage2_rows.append({"ticker": t, "avg_week_volume": avgv, "last_close": last_close, "source": "Stock"})
+                row = fut.result()
+                if row["avg_vol_3m"] is not None:
+                    results.append(row)
             except Exception:
                 continue
 
-        processed += len(block)
-        if callable(update_stage2):
-            update_stage2(processed, total2)
-
-    vol_df = pd.DataFrame(stage2_rows)
-
-    # If fewer than top_n, top up from FALLBACK_LIQUID per-ticker
-    if vol_df.empty or len(vol_df) < top_n:
-        seen = set(vol_df["ticker"].tolist()) if not vol_df.empty else set()
-        for t in FALLBACK_LIQUID:
-            if t in seen:
-                continue
-            sub = _safe_single_download(t, period="20d", interval="1d")
-            if sub is None or sub.empty or "Volume" not in sub.columns:
-                continue
-            sub = _exclude_today_if_open(sub)
-            avgv = _avg5(sub["Volume"])
-            if avgv is None:
-                continue
-            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
-            vol_df = pd.concat([vol_df, pd.DataFrame([{
-                "ticker": t, "avg_week_volume": avgv, "last_close": last_close, "source": "Stock"
-            }])], ignore_index=True)
-            if len(vol_df) >= max(top_n, 2*top_n):
-                break
-
+    vol_df = pd.DataFrame(results)
     if vol_df.empty:
-        return pd.DataFrame(columns=["ticker","avg_week_volume","last_close","source"])
+        return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close","source"])
 
-    vol_df = vol_df.dropna(subset=["avg_week_volume"]).sort_values("avg_week_volume", ascending=False)
-    top_stocks = vol_df.head(top_n).copy()
+    vol_df = vol_df.dropna(subset=["avg_vol_3m"]).sort_values("avg_vol_3m", ascending=False)
+    top_stocks = vol_df.head(TOP_STOCKS).copy()
+    top_stocks["source"] = "Stock"
 
-    if ADD_ETFS:
-        etf_rows = []
-        for etf in FIXED_ETFS:
-            hist = _safe_single_download(etf, period="20d", interval="1d")
-            hist = _exclude_today_if_open(hist)
-            avgv = _avg5(hist["Volume"]) if "Volume" in hist.columns else None
-            last_close = float(hist["Close"].dropna().iloc[-1]) if "Close" in hist.columns and not hist["Close"].dropna().empty else None
-            etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
-        top_full = pd.concat([top_stocks, pd.DataFrame(etf_rows)], ignore_index=True)
-    else:
-        top_full = top_stocks
+    # Append ETFs (always include)
+    etf_rows = []
+    for etf in FIXED_ETFS:
+        vol = get_avg_volume_3mo(etf)
+        px = get_last_close(etf)
+        etf_rows.append({"ticker": etf, "avg_vol_3m": vol, "last_close": px, "source": "ETF"})
+    full = pd.concat([top_stocks, pd.DataFrame(etf_rows)], ignore_index=True)
 
-    return top_full.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
+    # De-dup but keep stocks first, ETFs after
+    full["src_ord"] = (full["source"] == "ETF").astype(int)
+    full = (full.sort_values(["src_ord", "avg_vol_3m"], ascending=[True, False])
+                .drop_duplicates(subset=["ticker"], keep="first")
+                .drop(columns=["src_ord"])
+                .reset_index(drop=True))
+    return full
 
 # =========================
 # IV/FF calculations
@@ -459,7 +426,7 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
 # =========================
 # Screener
 # =========================
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
     spot = get_spot(ticker)
     if spot is None:
@@ -540,8 +507,10 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     s = series.copy()
     s_str = s.astype(str).str.strip()
     is_blank = s.isna() | s_str.isin(_BLANK_SET)
+
     pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", "", regex=False), errors="coerce")
     pct_mask = s_str.str.endswith("%") & ~pd.isna(pct_val)
+
     cur_mask = s_str.str.match(r"^\(?\$\s*[\d,]+(?:\.\d+)?\)?$")
     cur_core = (s_str
         .str.replace(r"^\(", "", regex=True)
@@ -552,24 +521,31 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     cur_val = pd.to_numeric(cur_core, errors="coerce")
     cur_neg = s_str.str.startswith("(") & s_str.str.endswith(")")
     cur_val = np.where(cur_neg, -cur_val, cur_val)
+
     num_val_plain = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
     num_key = np.where(~pd.isna(pct_val) & pct_mask, pct_val,
               np.where(~pd.isna(cur_val) & cur_mask, cur_val, num_val_plain))
     num_key = pd.to_numeric(num_key, errors="coerce")
+
     dt = pd.to_datetime(s_str, errors="coerce", utc=True)
     date_key = dt.view("int64")
     text_key = s_str.str.lower()
+
     is_num = ~pd.isna(num_key)
     is_date = pd.isna(num_key) & ~pd.isna(date_key)
     is_text = ~(is_num | is_date)
+
     t_code = np.select([is_num, is_date, is_text], [0, 1, 2], default=2)
+
     val = pd.Series(np.nan, index=s.index, dtype="object")
     val[is_num] = num_key[is_num]
     val[is_date] = date_key[is_date].astype("float64")
     val[is_text] = text_key[is_text]
+
     grp = np.where(is_blank, 1, 0)
     t_code = np.where(is_blank, 9, t_code)
     val = np.where(is_blank, "", val)
+
     return pd.DataFrame({"_grp": grp, "_t": t_code, "_val": val}, index=s.index)
 
 def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
@@ -601,10 +577,10 @@ DISPLAY_MAP = {
 LABEL_TO_KEY = {v: k for k, v in DISPLAY_MAP.items()}
 DISPLAY_KEYS = ["ticker","pair","exp1","dte1","iv1","exp2","dte2","iv2","fwd_vol","ff","cal_debit","earn_in_window"]
 
-st.title("📈 Forward Volatility Screener (Top 27 by 5-Day Avg Volume — All US Stocks)")
+st.title("📈 Forward Volatility Screener (Top 27 by 3M Avg Volume — All US Stocks)")
 st.markdown(
-    "Two-stage scan across **NASDAQ + NYSE/AMEX**. Ranks by **avg volume over the last 5 completed sessions** "
-    f"and selects **Top {TOP_STOCKS} stocks** (then adds {'VOO, SPY, QQQ' if ADD_ETFS else 'no ETFs'})."
+    "Ranks all **NASDAQ + NYSE/AMEX** stocks by **average daily volume over the last 3 months**, "
+    f"selects **Top {TOP_STOCKS} stocks**, then adds **SPY, QQQ, VOO**."
 )
 
 raw_extra = st.text_input("Optional: Add tickers (comma/space separated)", "", placeholder="e.g., NVDA, TSLA, META")
@@ -614,7 +590,7 @@ def trigger_run():
 
 colA, colB = st.columns([1, 3])
 with colA:
-    st.button("Build List & Run", type="primary", help="Two-stage fast scan across the US universe", on_click=trigger_run)
+    st.button("Build List & Run", type="primary", help="Rank by 3M avg volume, then scan options", on_click=trigger_run)
 with colB:
     st.caption("Excludes today's partial volume until after the 4:05pm ET close.")
 
@@ -622,25 +598,8 @@ with colB:
 if st.session_state.trigger_run:
     extras = _normalize_tickers(raw_extra)
 
-    prog1 = st.progress(0.0, text="Stage 1/2: Scanning universe (latest volumes)…")
-    prog2 = st.progress(0.0, text="Stage 2/2: Computing 5-day average on shortlist…")
-
-    def up1(done, total):
-        prog1.progress(min(done/total, 1.0), text=f"Stage 1/2: {done}/{total} tickers processed…")
-    def up2(done, total):
-        prog2.progress(min(done/total, 1.0), text=f"Stage 2/2: {done}/{total} tickers processed…")
-
-    with st.spinner("Building list…"):
-        vol_top_df = rank_top_stocks_all_us_pipeline(
-            extras=extras,
-            top_n=TOP_STOCKS,
-            add_etfs=ADD_ETFS,
-            update_stage1=up1,
-            update_stage2=up2,
-        )
-
-    prog1.empty()
-    prog2.empty()
+    with st.spinner("Building ranked list (3M avg volume)…"):
+        vol_top_df = rank_top27_by_3m_avg_with_etfs(extras=extras, shortlist_size=SHORTLIST_SIZE)
 
     st.session_state.vol_topN = vol_top_df
     st.session_state.tickers = vol_top_df["ticker"].tolist() if not vol_top_df.empty else []
@@ -655,18 +614,18 @@ if st.session_state.trigger_run:
 
     st.session_state.trigger_run = False
 
-# --------- Selected list (stocks + optional ETFs) ---------
+# --------- Selected list (stocks + ETFs) ---------
 if st.session_state.vol_topN is not None and not st.session_state.vol_topN.empty:
-    st.subheader(f"Selected Tickers (Top {TOP_STOCKS} Stocks by 5-Day Avg Vol{' + ETFs' if ADD_ETFS else ''})")
+    st.subheader(f"Selected Tickers (Top {TOP_STOCKS} Stocks by 3M Avg Vol + ETFs)")
     base = st.session_state.vol_topN.copy()
     source_order = pd.api.types.CategoricalDtype(categories=["Stock", "ETF"], ordered=True)
     base["Source"] = base["source"].astype(source_order)
     base["SourceOrder"] = base["Source"].cat.codes
-    base["AvgVolNum"] = pd.to_numeric(base["avg_week_volume"], errors="coerce")
+    base["AvgVolNum"] = pd.to_numeric(base["avg_vol_3m"], errors="coerce")
     base = base.sort_values(by=["SourceOrder", "AvgVolNum"], ascending=[True, False], kind="mergesort")
     disp = pd.DataFrame({
         "Ticker": base["ticker"],
-        "Avg Vol (5d)": base["AvgVolNum"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "—"),
+        "Avg Vol (3m)": base["AvgVolNum"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "—"),
         "Last Close": base["last_close"].apply(lambda v: f"${v:,.2f}" if pd.notna(v) else "—"),
         "Source": base["Source"].astype(str),
     })
@@ -703,11 +662,11 @@ else:
         hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
         color = "#ffffff"
         if earn and hot:
-            color = "#ffe0b2"
+            color = "#ffe0b2"  # both
         elif earn:
-            color = "#fff9c4"
+            color = "#fff9c4"  # earnings in window
         elif hot:
-            color = "#dcedc8"
+            color = "#dcedc8"  # FF >= 0.20
         return [f"background-color:{color}; color:#000000;"] * len(row)
 
     styled = (df_display.style
