@@ -1,6 +1,7 @@
 import math
 from datetime import datetime, date
 from typing import Optional, Tuple, List, Dict
+import re
 
 import numpy as np
 import pandas as pd
@@ -8,7 +9,6 @@ import pytz
 import streamlit as st
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import re
 
 # =========================
 # App/session setup
@@ -29,17 +29,20 @@ ADD_ETFS = True
 FIXED_ETFS = ["VOO", "SPY", "QQQ"]
 MAX_WORKERS = 12
 
-# Download tuning
-DL_CHUNK_STAGE1 = 80
-DL_CHUNK_STAGE2 = 50
-SHORTLIST_SIZE = 400
+# Download tuning (smaller blocks = fewer partial/empty returns from yfinance)
+DL_CHUNK_STAGE1 = 30
+DL_CHUNK_STAGE2 = 20
+SHORTLIST_SIZE = 500
 
-# A hard fallback list of liquid US tickers (ensures app never returns empty)
+# Large liquid fallback universe (100+)
 FALLBACK_LIQUID = [
-    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","AMD","NFLX","CRM","COST","PEP",
-    "ADBE","INTC","UBER","JPM","BAC","XOM","CVX","KO","PFE","WMT","T","ORCL","QCOM","V","MA","PYPL",
-    "WFC","GE","NKE","MRNA","DIS","BA","MU","PLTR","SOFI","CCL","NIO","RIVN","LCID","F","GM","SNAP",
-    "SQ","SHOP","ABNB","MMM","IBM","VZ","CSCO","AMAT","TSM","BABA","BIDU","PDD","RIO","TQQQ","SQQQ"
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","AMD","NFLX","CRM","COST","PEP","ADBE","INTC",
+    "UBER","QCOM","AMAT","TSM","ORCL","PFE","MRK","JNJ","LLY","V","MA","JPM","BAC","WFC","C","GS","MS","SCHW","BLK",
+    "GE","HON","CAT","BA","NKE","KO","PEP","PG","MCD","WMT","HD","LOW","TGT","DIS","CMCSA","T","VZ","TMUS","CSCO",
+    "PANW","NOW","SNOW","DDOG","NET","MDB","ZS","PLTR","SHOP","ABNB","PYPL","SQ","ROKU","TTD","SPOT","DKNG","RBLX",
+    "MU","NXPI","TXN","ADI","ON","LRCX","KLAC","ASML","BABA","BIDU","PDD","RIO","BHP","CVX","XOM","COP","OXY","SLB",
+    "F","GM","RIVN","LCID","NIO","CCL","AAL","UAL","DAL","UPS","FDX","SOFI","COIN","HOOD","GME","BBBYQ",  # if delisted returns empty, our guards skip
+    "TQQQ","SQQQ","QQQ","SPY","VOO"  # ETFs may show up; okay—we de-dup later and still add fixed ETFs
 ]
 
 # =========================
@@ -89,12 +92,11 @@ def _normalize_tickers(raw: str) -> List[str]:
     return out
 
 def _is_clean_us_symbol(sym: str) -> bool:
-    # Allow letters/digits and a single hyphen; exclude weird/OTC/indices/units, etc.
-    # (yfinance can choke on many exotic/non-US formats)
+    # Allow up to 5 letters/digits (+ optional hyphen suffix). Skip indexes/OTC prefixed weirdness.
     return bool(re.fullmatch(r"[A-Z0-9]{1,5}(-[A-Z0-9]{1,2})?", sym))
 
 # =========================
-# yfinance (cached data)
+# yfinance (cached)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def get_spot(ticker: str) -> Optional[float]:
@@ -110,7 +112,6 @@ def get_spot(ticker: str) -> Optional[float]:
 def get_options(ticker: str) -> List[str]:
     try:
         opts = yf.Ticker(ticker).options or []
-        # yfinance returns 'YYYY-MM-DD' strings
         return [e for e in opts if isinstance(e, str) and len(e) == 10 and e[4] == "-" and e[7] == "-"]
     except Exception:
         return []
@@ -150,12 +151,11 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
     return None
 
 # =========================
-# Universe and downloads
+# Universe & downloads
 # =========================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_us_stock_universe() -> List[str]:
     candidates: List[str] = []
-    # Try yfinance helpers (when available in the runtime)
     for fn_name in ["tickers_nasdaq", "tickers_other", "tickers_sp500"]:
         try:
             fn = getattr(yf, fn_name, None)
@@ -165,15 +165,9 @@ def get_us_stock_universe() -> List[str]:
                     candidates.extend([str(t).strip().upper() for t in vals if t])
         except Exception:
             continue
-
-    # De-dup and sanitize
     candidates = [t for t in dict.fromkeys(candidates) if _is_clean_us_symbol(t)]
-
-    # Hard fallback if nothing came back (or if environment blocks those helpers)
     if not candidates:
         candidates = FALLBACK_LIQUID.copy()
-
-    # Make sure it’s not empty
     return list(dict.fromkeys(candidates))
 
 def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
@@ -195,9 +189,13 @@ def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
 def _avg5(vol: pd.Series) -> Optional[float]:
     vols = vol.dropna()
     last5 = vols.tail(5)
-    if len(last5) < 5:
-        return None
-    return float(last5.mean())
+    if len(last5) >= 5:
+        return float(last5.mean())
+    # relax to last 3 if fewer than 5 sessions available
+    last3 = vols.tail(3)
+    if len(last3) >= 3:
+        return float(last3.mean())
+    return None
 
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
@@ -219,11 +217,16 @@ def _safe_multi_download(tickers, period, interval):
     except Exception:
         return pd.DataFrame()
 
+def _safe_single_download(ticker, period, interval):
+    try:
+        return yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
+    except Exception:
+        return pd.DataFrame()
+
 # ---------- Two-stage ranker ----------
 def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: bool,
                                     update_stage1=None, update_stage2=None) -> pd.DataFrame:
     universe = get_us_stock_universe()
-    # Add any user extras
     for e in extras:
         e = e.strip().upper()
         if _is_clean_us_symbol(e) and e not in universe:
@@ -233,12 +236,37 @@ def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: boo
     stage1_rows = []
     processed = 0
     total = len(universe)
+
     for block in _chunks(universe, DL_CHUNK_STAGE1):
         data = _safe_multi_download(block, period="7d", interval="1d")
-        got = [c[0] for c in getattr(data, "columns", pd.Index([])).unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
+
+        got = []
+        if isinstance(getattr(data, "columns", None), pd.MultiIndex):
+            got = [c[0] for c in data.columns.unique(level=0)]
+        elif isinstance(data, pd.DataFrame) and not data.empty:
+            # odd case: yfinance returned single-frame for one symbol → assume whole block failed, fall back per-ticker
+            got = []
+
+        # Per-ticker fallback for any missing names in the block
+        missing = set(block) - set(got)
+        for t in list(missing):
+            sub = _safe_single_download(t, period="7d", interval="1d")
+            if not sub.empty:
+                # emulate multi-index access path
+                if isinstance(getattr(data, "columns", None), pd.MultiIndex):
+                    data[(t, "Open")] = np.nan  # just to ensure t appears (we won't use Open)
+                got.append(t)
+                # attach a dict entry for reading below
+                if not hasattr(data, "_single_store"):
+                    data._single_store = {}
+                data._single_store[t] = sub
+
         for t in got:
             try:
-                sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+                if hasattr(data, "_single_store") and t in data._single_store:
+                    sub = data._single_store[t]
+                else:
+                    sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
                 if sub is None or sub.empty or "Volume" not in sub.columns:
                     continue
                 sub = _exclude_today_if_open(sub)
@@ -249,93 +277,103 @@ def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: boo
                 stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
             except Exception:
                 continue
+
         processed += len(block)
         if callable(update_stage1):
             update_stage1(processed, total)
 
-    # If Stage 1 somehow empty, hard fallback to our liquid list and retry once
+    # If still empty, build Stage 1 from FALLBACK_LIQUID (per-ticker)
     if not stage1_rows:
-        for block in _chunks(FALLBACK_LIQUID, DL_CHUNK_STAGE1):
-            data = _safe_multi_download(block, period="7d", interval="1d")
-            if data is None or data.empty:
+        for t in FALLBACK_LIQUID:
+            sub = _safe_single_download(t, period="7d", interval="1d")
+            if sub is None or sub.empty or "Volume" not in sub.columns:
                 continue
-            got = [c[0] for c in data.columns.unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
-            for t in got:
-                try:
-                    sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
-                    sub = _exclude_today_if_open(sub)
-                    if "Volume" not in sub.columns or sub["Volume"].dropna().empty:
-                        continue
-                    last_vol = float(sub["Volume"].dropna().iloc[-1])
-                    last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
-                    stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
-                except Exception:
-                    continue
+            sub = _exclude_today_if_open(sub)
+            if sub["Volume"].dropna().empty:
+                continue
+            last_vol = float(sub["Volume"].dropna().iloc[-1])
+            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+            stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
 
     if not stage1_rows:
-        # still empty; return ETFs only so the app shows *something*
+        # show ETFs at least
         etf_rows = []
         for etf in FIXED_ETFS:
-            try:
-                hist = yf.download(etf, period="20d", interval="1d", auto_adjust=False, progress=False)
-                hist = _exclude_today_if_open(hist)
-                avgv = _avg5(hist["Volume"]) if "Volume" in hist.columns else None
-                last_close = float(hist["Close"].dropna().iloc[-1]) if "Close" in hist.columns and not hist["Close"].dropna().empty else None
-                etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
-            except Exception:
-                continue
+            hist = _safe_single_download(etf, period="20d", interval="1d")
+            hist = _exclude_today_if_open(hist)
+            avgv = _avg5(hist["Volume"]) if "Volume" in hist.columns else None
+            last_close = float(hist["Close"].dropna().iloc[-1]) if "Close" in hist.columns and not hist["Close"].dropna().empty else None
+            etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
         return pd.DataFrame(etf_rows)
 
     stage1 = pd.DataFrame(stage1_rows).dropna(subset=["last_vol"]).sort_values("last_vol", ascending=False)
     shortlist = stage1["ticker"].head(SHORTLIST_SIZE).tolist()
 
-    # Stage 2 — accurate 5-day average on shortlist
+    # Stage 2 — accurate avg over last 5 (or 3) sessions
     stage2_rows = []
     processed = 0
     total2 = len(shortlist)
+
     for block in _chunks(shortlist, DL_CHUNK_STAGE2):
         data = _safe_multi_download(block, period="20d", interval="1d")
-        got = [c[0] for c in getattr(data, "columns", pd.Index([])).unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
+
+        got = []
+        if isinstance(getattr(data, "columns", None), pd.MultiIndex):
+            got = [c[0] for c in data.columns.unique(level=0)]
+
+        missing = set(block) - set(got)
+        for t in list(missing):
+            sub = _safe_single_download(t, period="20d", interval="1d")
+            if not sub.empty:
+                if isinstance(getattr(data, "columns", None), pd.MultiIndex):
+                    data[(t, "Open")] = np.nan
+                got.append(t)
+                if not hasattr(data, "_single_store"):
+                    data._single_store = {}
+                data._single_store[t] = sub
+
         for t in got:
             try:
-                sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+                if hasattr(data, "_single_store") and t in data._single_store:
+                    sub = data._single_store[t]
+                else:
+                    sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
                 if sub is None or sub.empty or "Volume" not in sub.columns:
                     continue
                 sub = _exclude_today_if_open(sub)
-                avgv = _avg5(sub["Volume"]) if "Volume" in sub.columns else None
+                avgv = _avg5(sub["Volume"])
                 if avgv is None:
                     continue
                 last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
                 stage2_rows.append({"ticker": t, "avg_week_volume": avgv, "last_close": last_close, "source": "Stock"})
             except Exception:
                 continue
+
         processed += len(block)
         if callable(update_stage2):
             update_stage2(processed, total2)
 
     vol_df = pd.DataFrame(stage2_rows)
-    if vol_df.empty:
-        # as a fallback, compute 5d on FALLBACK_LIQUID
-        for block in _chunks(FALLBACK_LIQUID, DL_CHUNK_STAGE2):
-            data = _safe_multi_download(block, period="20d", interval="1d")
-            if data is None or data.empty:
+
+    # If fewer than top_n, top up from FALLBACK_LIQUID per-ticker
+    if vol_df.empty or len(vol_df) < top_n:
+        seen = set(vol_df["ticker"].tolist()) if not vol_df.empty else set()
+        for t in FALLBACK_LIQUID:
+            if t in seen:
                 continue
-            got = [c[0] for c in data.columns.unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
-            for t in got:
-                try:
-                    sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
-                    sub = _exclude_today_if_open(sub)
-                    if "Volume" not in sub.columns:
-                        continue
-                    avgv = _avg5(sub["Volume"])
-                    if avgv is None:
-                        continue
-                    last_close = float(sub["Close"].dropna().iloc[-1])
-                    vol_df = pd.concat([vol_df, pd.DataFrame([{
-                        "ticker": t, "avg_week_volume": avgv, "last_close": last_close, "source": "Stock"
-                    }])], ignore_index=True)
-                except Exception:
-                    continue
+            sub = _safe_single_download(t, period="20d", interval="1d")
+            if sub is None or sub.empty or "Volume" not in sub.columns:
+                continue
+            sub = _exclude_today_if_open(sub)
+            avgv = _avg5(sub["Volume"])
+            if avgv is None:
+                continue
+            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+            vol_df = pd.concat([vol_df, pd.DataFrame([{
+                "ticker": t, "avg_week_volume": avgv, "last_close": last_close, "source": "Stock"
+            }])], ignore_index=True)
+            if len(vol_df) >= max(top_n, 2*top_n):
+                break
 
     if vol_df.empty:
         return pd.DataFrame(columns=["ticker","avg_week_volume","last_close","source"])
@@ -346,14 +384,11 @@ def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: boo
     if ADD_ETFS:
         etf_rows = []
         for etf in FIXED_ETFS:
-            try:
-                hist = yf.download(etf, period="20d", interval="1d", auto_adjust=False, progress=False)
-                hist = _exclude_today_if_open(hist)
-                avgv = _avg5(hist["Volume"]) if "Volume" in hist.columns else None
-                last_close = float(hist["Close"].dropna().iloc[-1]) if "Close" in hist.columns and not hist["Close"].dropna().empty else None
-                etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
-            except Exception:
-                etf_rows.append({"ticker": etf, "avg_week_volume": None, "last_close": None, "source": "ETF"})
+            hist = _safe_single_download(etf, period="20d", interval="1d")
+            hist = _exclude_today_if_open(hist)
+            avgv = _avg5(hist["Volume"]) if "Volume" in hist.columns else None
+            last_close = float(hist["Close"].dropna().iloc[-1]) if "Close" in hist.columns and not hist["Close"].dropna().empty else None
+            etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
         top_full = pd.concat([top_stocks, pd.DataFrame(etf_rows)], ignore_index=True)
     else:
         top_full = top_stocks
@@ -371,13 +406,11 @@ def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     if len(strikes) == 0:
         return None
     atm = float(min(strikes, key=lambda s: abs(s - spot)))
-
     def iv_from(df: pd.DataFrame) -> Optional[float]:
         if df is None or df.empty:
             return None
         row = df.loc[df["strike"].astype(float) == atm]
         return None if row.empty else _first_float(row["impliedVolatility"].iloc[0])
-
     c_iv, p_iv = iv_from(calls), iv_from(puts)
     if c_iv is None and p_iv is None:
         return None
@@ -424,7 +457,7 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
     return fwd_sigma, ff
 
 # =========================
-# Screener (per ticker)
+# Screener
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
@@ -570,8 +603,8 @@ DISPLAY_KEYS = ["ticker","pair","exp1","dte1","iv1","exp2","dte2","iv2","fwd_vol
 
 st.title("📈 Forward Volatility Screener (Top 27 by 5-Day Avg Volume — All US Stocks)")
 st.markdown(
-    "Two-stage scan across **NASDAQ + NYSE/AMEX**. Ranks by **avg volume over the last 5 completed sessions**, "
-    f"selects the **Top {TOP_STOCKS} stocks**, and {'adds **VOO, SPY, QQQ**' if ADD_ETFS else 'does not add ETFs'}."
+    "Two-stage scan across **NASDAQ + NYSE/AMEX**. Ranks by **avg volume over the last 5 completed sessions** "
+    f"and selects **Top {TOP_STOCKS} stocks** (then adds {'VOO, SPY, QQQ' if ADD_ETFS else 'no ETFs'})."
 )
 
 raw_extra = st.text_input("Optional: Add tickers (comma/space separated)", "", placeholder="e.g., NVDA, TSLA, META")
@@ -618,7 +651,7 @@ if st.session_state.trigger_run:
         st.success("✅ Scan complete! Results displayed below.")
     else:
         st.session_state.df = pd.DataFrame()
-        st.warning("No tickers selected by the ranking step (API limits or market closed). Using the input box above can help.")
+        st.warning("No tickers selected by the ranking step. Try adding a few symbols above.")
 
     st.session_state.trigger_run = False
 
@@ -693,7 +726,6 @@ else:
     st.markdown(styled.to_html(), unsafe_allow_html=True)
     st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
 
-# Footer
 st.markdown(
     "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
     unsafe_allow_html=True,
