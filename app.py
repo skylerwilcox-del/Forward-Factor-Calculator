@@ -13,13 +13,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # App/session setup
 # =========================
 PACIFIC = pytz.timezone("America/Los_Angeles")
-st.set_page_config(page_title="Forward Vol Screener", layout="wide")
+st.set_page_config(page_title="Forward Vol Screener — Top 30 by Volume", layout="wide")
 
-# Persist results across reruns (sorting control changes)
-if "df" not in st.session_state:
-    st.session_state.df = None
-if "tickers" not in st.session_state:
-    st.session_state.tickers = []
+# Persist results across reruns
+for k in ("df", "tickers", "vol_top30"):
+    if k not in st.session_state:
+        st.session_state[k] = None if k != "tickers" else []
 
 # Friendly display names (and reverse map)
 DISPLAY_MAP = {
@@ -45,8 +44,8 @@ DISPLAY_KEYS = [
     "cal_debit", "earn_in_window"
 ]
 
-# Concurrency for scanning (network bound → benefits from IO parallelism)
-MAX_WORKERS = 8
+# Concurrency
+MAX_WORKERS = 12
 
 # =========================
 # Helpers
@@ -86,9 +85,7 @@ def _expiry_to_date(expiry_iso: str) -> Optional[date]:
         return None
 
 def _normalize_tickers(raw: str) -> List[str]:
-    # de-dup while preserving order
-    seen = set()
-    out = []
+    seen, out = set(), []
     for t in raw.replace(",", " ").split():
         t = t.strip().upper()
         if t and t not in seen:
@@ -113,7 +110,6 @@ def get_spot(ticker: str) -> Optional[float]:
 def get_options(ticker: str) -> List[str]:
     try:
         opts = yf.Ticker(ticker).options or []
-        # filter ISO-like dates just in case
         return [e for e in opts if isinstance(e, str) and len(e) == 10 and e[4] == "-" and e[7] == "-"]
     except Exception:
         return []
@@ -137,7 +133,6 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
                 return min(fut)
     except Exception:
         pass
-    # Fallback fields
     for src in (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {})):
         if src is None:
             continue
@@ -152,6 +147,31 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
             except Exception:
                 continue
     return None
+
+# ---- Volume helpers ----
+@st.cache_data(ttl=600, show_spinner=False)
+def get_avg_week_volume(ticker: str) -> Optional[float]:
+    """Average daily volume over the most recent 5 trading days."""
+    try:
+        df = yf.Ticker(ticker).history(period="10d", interval="1d", auto_adjust=False)
+        if df is None or df.empty or "Volume" not in df.columns:
+            return None
+        vol = df["Volume"].dropna().tail(5)
+        if vol.empty:
+            return None
+        return float(vol.mean())
+    except Exception:
+        return None
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_close_price(ticker: str) -> Optional[float]:
+    try:
+        df = yf.Ticker(ticker).history(period="5d", interval="1d", auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        return float(df["Close"].dropna().iloc[-1])
+    except Exception:
+        return None
 
 # =========================
 # Calculations
@@ -211,6 +231,74 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
     fwd_sigma = math.sqrt(fwd_var)
     ff = None if fwd_sigma == 0 else (s1 - fwd_sigma) / fwd_sigma
     return fwd_sigma, ff
+
+# =========================
+# Universe & Top-30 selector
+# =========================
+DEFAULT_ETFS = [
+    # Broad index & liquid sector/theme ETFs
+    "SPY","QQQ","IWM","DIA","VTI","VOO","IVV","SPLG",
+    "XLK","XLF","XLV","XLY","XLP","XLE","XLI","XLU","XLB",
+    "ARKK","SMH","SOXX","TLT","HYG","LQD","BITO","GLD","SLV","USO"
+]
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_universe() -> List[str]:
+    tickers = []
+    # Try to pull S&P500 from yfinance
+    try:
+        spx = yf.tickers_sp500()
+        if isinstance(spx, (list, tuple)) and len(spx) > 0:
+            tickers.extend(spx)
+    except Exception:
+        pass
+    # Always include a basket of very liquid ETFs
+    tickers.extend(DEFAULT_ETFS)
+    # De-dup and keep order
+    seen, out = set(), []
+    for t in tickers:
+        t = t.strip().upper()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+def _avg_vol_worker(t: str) -> Tuple[str, Optional[float]]:
+    return t, get_avg_week_volume(t)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def select_top30_by_volume(extra: List[str]) -> pd.DataFrame:
+    """
+    Build Top-30 by 1-week avg volume from S&P500 + default ETFs + user extras.
+    Returns a DataFrame with columns: ticker, avg_week_volume, last_close.
+    """
+    universe = get_universe()
+    # Add user-provided extras (if any)
+    for e in extra:
+        if e not in universe:
+            universe.append(e)
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(4, len(universe)//30))) as ex:
+        futs = {ex.submit(_avg_vol_worker, t): t for t in universe}
+        progress = st.progress(0.0, text="Ranking by 1-week average volume…")
+        done = 0
+        for fut in as_completed(futs):
+            t, avgv = fut.result()
+            rows.append({"ticker": t, "avg_week_volume": avgv})
+            done += 1
+            progress.progress(done/len(universe))
+        progress.empty()
+
+    vol_df = pd.DataFrame(rows)
+    vol_df = vol_df.dropna(subset=["avg_week_volume"]).sort_values("avg_week_volume", ascending=False).head(30).reset_index(drop=True)
+
+    # Add a price column for context (non-blocking sequential to keep API load low)
+    prices = []
+    for t in vol_df["ticker"]:
+        prices.append(get_close_price(t))
+    vol_df["last_close"] = prices
+    return vol_df
 
 # =========================
 # Screener (cached per ticker)
@@ -278,17 +366,14 @@ def screen_ticker(ticker: str) -> List[Dict]:
     return rows
 
 def scan_many(tickers: List[str]) -> pd.DataFrame:
-    """Parallel scan over tickers (network bound) with progress."""
     rows: List[Dict] = []
     if not tickers:
         return pd.DataFrame(rows)
 
-    progress = st.progress(0.0, text="Starting…")
-    done = 0
-
-    # Threading is appropriate here due to IO waits in yfinance
+    progress = st.progress(0.0, text="Scanning option chains…")
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(tickers)))) as ex:
         fut_map = {ex.submit(screen_ticker, t): t for t in tickers}
+        done = 0
         for fut in as_completed(fut_map):
             t = fut_map[fut]
             try:
@@ -316,21 +401,13 @@ def scan_many(tickers: List[str]) -> pd.DataFrame:
 _BLANK_SET = {"", "-", "—", "–"}
 
 def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
-    """
-    Build helper columns for safe sorting across mixed types.
-    _grp: 0=non-blank, 1=blank (blanks go last)
-    _t  : 0=numeric, 1=date, 2=text, 9=blank
-    _val: numeric value (float) or lowercased string
-    """
     s = series.copy()
     s_str = s.astype(str).str.strip()
     is_blank = s.isna() | s_str.isin(_BLANK_SET)
 
-    # Percent: "12.34%"
     pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", "", regex=False), errors="coerce")
     pct_mask = s_str.str.endswith("%") & ~pd.isna(pct_val)
 
-    # Currency: "$1,234.56" or "($1,234.56)"
     cur_mask = s_str.str.match(r"^\(?\$\s*[\d,]+(?:\.\d+)?\)?$")
     cur_core = (s_str
                 .str.replace(r"^\(", "", regex=True)
@@ -342,35 +419,28 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     cur_neg = s_str.str.startswith("(") & s_str.str.endswith(")")
     cur_val = np.where(cur_neg, -cur_val, cur_val)
 
-    # Plain numbers (allow commas)
     num_val_plain = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
 
-    # Prefer: percent > currency > plain
     num_key = np.where(~pd.isna(pct_val) & pct_mask, pct_val,
               np.where(~pd.isna(cur_val) & cur_mask, cur_val, num_val_plain))
     num_key = pd.to_numeric(num_key, errors="coerce")
 
-    # Dates (anything pandas can parse)
     dt = pd.to_datetime(s_str, errors="coerce", utc=True)
-    date_key = dt.view("int64")  # ns since epoch; NaT → NaN
+    date_key = dt.view("int64")
 
-    # Text fallback
     text_key = s_str.str.lower()
 
-    # Type selection
     is_num = ~pd.isna(num_key)
     is_date = pd.isna(num_key) & ~pd.isna(date_key)
     is_text = ~(is_num | is_date)
 
     t_code = np.select([is_num, is_date, is_text], [0, 1, 2], default=2)
 
-    # Value by type
     val = pd.Series(np.nan, index=s.index, dtype="object")
     val[is_num] = num_key[is_num]
     val[is_date] = date_key[is_date].astype("float64")
     val[is_text] = text_key[is_text]
 
-    # Blanks last
     grp = np.where(is_blank, 1, 0)
     t_code = np.where(is_blank, 9, t_code)
     val = np.where(is_blank, "", val)
@@ -392,42 +462,49 @@ def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
 # =========================
 # UI
 # =========================
-st.title("📈 Forward Volatility Screener")
+st.title("📈 Forward Volatility Screener (Top 30 by 1-Week Avg Volume)")
 
-raw = st.text_area(
-    "Tickers (comma / space separated):",
-    "AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, NFLX, AMD, AVGO, SPY, VOO, RIVN",
-    height=96,
-)
+st.markdown("The app automatically finds the **Top 30 most-traded stocks/ETFs by 1-week average volume** and scans those. Optionally add more tickers below.")
 
-col_run, col_download = st.columns([1, 1], vertical_alignment="center")
-with col_run:
-    run = st.button("Run Screener", type="primary")
-with col_download:
-    # Download last results if available
-    if st.session_state.df is not None and not st.session_state.df.empty:
-        # Build display df to match on-screen headers (no _tags)
-        have_keys = [k for k in DISPLAY_KEYS if k in st.session_state.df.columns]
-        df_export = st.session_state.df[have_keys].copy()
-        df_export.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
-        csv_bytes = df_export.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", data=csv_bytes, file_name="forward_vol_screener.csv", mime="text/csv")
+# User extras are optional
+raw_extra = st.text_input("Optional: Add tickers (comma/space separated)", "", placeholder="e.g., NVDA, TSLA, META")
 
-# Compute on click, then persist results
+auto_col1, auto_col2 = st.columns([1, 3])
+with auto_col1:
+    run = st.button("Find Top 30 & Run", type="primary")
+with auto_col2:
+    st.caption("Ranking source universe: S&P 500 + a basket of highly liquid ETFs")
+
+# Build & persist Top 30 → then run screener
 if run:
-    tickers = _normalize_tickers(raw)
+    extra = _normalize_tickers(raw_extra)
+    vol_top30_df = select_top30_by_volume(extra)
+    st.session_state.vol_top30 = vol_top30_df
+    tickers = vol_top30_df["ticker"].tolist()
     st.session_state.tickers = tickers
     st.session_state.df = scan_many(tickers)
 
-# --------- Render/sort outside the button block ---------
-df_current = st.session_state.df
+# Show the selected Top 30 list (with volumes)
+if st.session_state.vol_top30 is not None and not st.session_state.vol_top30.empty:
+    st.subheader("Top 30 by 1-Week Average Volume")
+    top30_disp = st.session_state.vol_top30.rename(columns={
+        "ticker": "Ticker",
+        "avg_week_volume": "Avg Vol (5d)",
+        "last_close": "Last Close"
+    }).copy()
+    # Pretty formatting
+    top30_disp["Avg Vol (5d)"] = top30_disp["Avg Vol (5d)"].map(lambda v: f"{int(v):,}")
+    top30_disp["Last Close"] = top30_disp["Last Close"].map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
+    st.dataframe(top30_disp, use_container_width=True, hide_index=True)
 
+# --------- Render forward-vol table ---------
+df_current = st.session_state.df
 if df_current is None or df_current.empty:
-    st.info("Enter tickers and click **Run Screener** to see results.")
+    st.info("Click **Find Top 30 & Run** to rank by volume and scan options.")
 else:
-    # Sorting controls use friendly labels, then map back to real keys
+    # Sorting controls use friendly labels
     display_labels = [DISPLAY_MAP[k] for k in DISPLAY_KEYS if k in df_current.columns]
-    default_label = DISPLAY_MAP["ff"] if "ff" in df_current.columns else display_labels[0]
+    default_label = DISPLAY_MAP.get("ff", display_labels[0])
 
     c1, c2, c3 = st.columns([3, 1.2, 1.8], vertical_alignment="bottom")
     with c1:
@@ -441,12 +518,12 @@ else:
     sort_key = LABEL_TO_KEY.get(sort_label, "ff")
     df_sorted = sort_df(df_current, sort_key, sort_ascending)
 
-    # --- Build display df: drop _tags and rename headers ---
+    # Build display df: drop _tags and rename headers
     have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
     df_display = df_sorted[have_keys].copy()
     df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
 
-    # --- Row highlighting based on hidden _tags (kept in df_sorted) ---
+    # Row highlighting based on hidden _tags (kept in df_sorted)
     tags_series = df_sorted["_tags"] if "_tags" in df_sorted.columns else pd.Series([[]]*len(df_sorted), index=df_sorted.index)
 
     def _highlight_row(row: pd.Series):
@@ -468,7 +545,6 @@ else:
             .set_properties(**{"border": "1px solid #bbb", "color": "#000", "font-size": "14px"})
     )
 
-    # Readable table (sticky header + zebra stripes)
     st.markdown(
         """
         <style>
@@ -488,4 +564,3 @@ else:
         "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
         unsafe_allow_html=True,
     )
-
