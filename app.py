@@ -16,10 +16,11 @@ PACIFIC = pytz.timezone("America/Los_Angeles")
 EASTERN = pytz.timezone("America/New_York")
 st.set_page_config(page_title="Forward Vol Screener — Top 27 (All US Stocks)", layout="wide")
 
-# Persist results across reruns (don’t overwrite if already set)
-if "df" not in st.session_state: st.session_state.df = None
-if "tickers" not in st.session_state: st.session_state.tickers = []
-if "vol_topN" not in st.session_state: st.session_state.vol_topN = None
+# Persist results across reruns
+st.session_state.setdefault("df", None)
+st.session_state.setdefault("tickers", [])
+st.session_state.setdefault("vol_topN", None)
+st.session_state.setdefault("go", False)  # stable run flag set by button
 
 # --- Config ---
 TOP_STOCKS = 27            # number of stocks to select
@@ -28,7 +29,7 @@ FIXED_ETFS = ["VOO", "SPY", "QQQ"]
 MAX_WORKERS = 12           # options-chain parallelism
 
 # Download tuning
-DL_CHUNK_STAGE1 = 80       # small chunks → more responsive UI for the quick pass
+DL_CHUNK_STAGE1 = 80       # small chunks → responsive UI for the quick pass
 DL_CHUNK_STAGE2 = 50       # shortlist chunks (heavier columns, keep small)
 SHORTLIST_SIZE = 400       # how many symbols to carry to the accurate pass
 
@@ -79,7 +80,7 @@ def _normalize_tickers(raw: str) -> List[str]:
     return out
 
 # =========================
-# yfinance (cached)
+# yfinance (cached data helpers — NO st.* inside)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def get_spot(ticker: str) -> Optional[float]:
@@ -134,16 +135,11 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
     return None
 
 # =========================
-# Volume ranking (ALL US stocks) — two-stage faster pipeline
+# Universe and downloads (NO st.* here)
 # =========================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_us_stock_universe() -> List[str]:
-    """
-    Build a broad U.S. stock universe from yfinance helpers.
-    Falls back gracefully if any helper is missing on your yfinance version.
-    """
     tickers = []
-    # NASDAQ
     try:
         nas = getattr(yf, "tickers_nasdaq", None)
         if callable(nas):
@@ -152,7 +148,6 @@ def get_us_stock_universe() -> List[str]:
                 tickers.extend([t.strip().upper() for t in r if t])
     except Exception:
         pass
-    # "Other" (NYSE/AMEX/misc)
     try:
         oth = getattr(yf, "tickers_other", None)
         if callable(oth):
@@ -161,7 +156,6 @@ def get_us_stock_universe() -> List[str]:
                 tickers.extend([t.strip().upper() for t in r if t])
     except Exception:
         pass
-    # If nothing returned, use S&P500 as a minimal fallback so the app still runs
     if not tickers:
         try:
             spx = getattr(yf, "tickers_sp500", None)
@@ -171,7 +165,6 @@ def get_us_stock_universe() -> List[str]:
                     tickers.extend([t.strip().upper() for t in r if t])
         except Exception:
             pass
-    # Dedup, preserve order
     seen, out = set(), []
     for t in tickers:
         if t and t not in seen:
@@ -180,7 +173,6 @@ def get_us_stock_universe() -> List[str]:
     return out
 
 def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
-    """Exclude today's partial bar based on US market close (after ~4:05pm ET is 'closed')."""
     if df is None or df.empty:
         return df
     idx = df.index
@@ -189,7 +181,6 @@ def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
     idx_et = idx.tz_convert(EASTERN)
     df = df.copy()
     df["et_date"] = idx_et.date
-
     now_et = datetime.now(EASTERN)
     today_et = now_et.date()
     market_closed = (now_et.hour > 16) or (now_et.hour == 16 and now_et.minute >= 5)
@@ -222,36 +213,24 @@ def _safe_multi_download(tickers, period, interval):
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=900, show_spinner=False)
-def rank_top_stocks_all_us(extras_tuple: tuple, top_n: int = TOP_STOCKS, add_etfs: bool = ADD_ETFS) -> pd.DataFrame:
-    """
-    Fast two-stage volume ranking across the full U.S. universe:
-      Stage 1: 7d data, use last completed session volume → shortlist (SHORTLIST_SIZE).
-      Stage 2: 20d data, compute true 5-day avg → pick top_n.
-      Append ETFs if requested.
-    extras_tuple must be a tuple for caching.
-    """
-    extras = list(extras_tuple)
+# ---------- Two-stage ranker (UI controls/progress handled OUTSIDE) ----------
+def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: bool,
+                                    update_stage1=None, update_stage2=None) -> pd.DataFrame:
     universe = get_us_stock_universe()
-    # Include extras in the universe so they get considered in ranking
     for e in extras:
         if e not in universe:
             universe.append(e)
 
-    # ---------- Stage 1: fast shortlist by last completed session volume ----------
+    # Stage 1: shortlist by last completed session volume
     stage1_rows = []
-    total = len(universe)
-    prog1 = st.progress(0.0, text="Stage 1/2: Scanning universe (latest volumes)…")
     processed = 0
-
+    total = len(universe)
     for block in _chunks(universe, DL_CHUNK_STAGE1):
         data = _safe_multi_download(block, period="7d", interval="1d")
-        # Figure which tickers we actually got back
         if isinstance(data.columns, pd.MultiIndex):
             got = [c[0] for c in data.columns.unique(level=0)]
         else:
             got = block
-
         for t in got:
             try:
                 sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
@@ -265,10 +244,9 @@ def rank_top_stocks_all_us(extras_tuple: tuple, top_n: int = TOP_STOCKS, add_etf
                 stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
             except Exception:
                 continue
-
         processed += len(block)
-        prog1.progress(min(processed/total, 1.0))
-    prog1.empty()
+        if callable(update_stage1):
+            update_stage1(processed, total)
 
     if not stage1_rows:
         return pd.DataFrame(columns=["ticker","avg_week_volume","last_close","source"])
@@ -276,36 +254,32 @@ def rank_top_stocks_all_us(extras_tuple: tuple, top_n: int = TOP_STOCKS, add_etf
     stage1 = pd.DataFrame(stage1_rows).dropna(subset=["last_vol"]).sort_values("last_vol", ascending=False)
     shortlist = stage1["ticker"].head(SHORTLIST_SIZE).tolist()
 
-    # ---------- Stage 2: accurate 5-day average on shortlist ----------
+    # Stage 2: accurate 5-day average on shortlist
     stage2_rows = []
-    prog2 = st.progress(0.0, text="Stage 2/2: Computing 5-day average volume on shortlist…")
     processed = 0
+    total2 = len(shortlist)
     for block in _chunks(shortlist, DL_CHUNK_STAGE2):
         data = _safe_multi_download(block, period="20d", interval="1d")
         if isinstance(data.columns, pd.MultiIndex):
             got = [c[0] for c in data.columns.unique(level=0)]
         else:
             got = block
-
         for t in got:
             try:
                 sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
                 if sub is None or sub.empty or "Volume" not in sub.columns:
                     continue
                 sub = _exclude_today_if_open(sub)
-                if "Volume" not in sub.columns:
-                    continue
-                avgv = _avg5(sub["Volume"])
+                avgv = _avg5(sub["Volume"]) if "Volume" in sub.columns else None
                 if avgv is None:
                     continue
                 last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
                 stage2_rows.append({"ticker": t, "avg_week_volume": avgv, "last_close": last_close, "source": "Stock"})
             except Exception:
                 continue
-
         processed += len(block)
-        prog2.progress(min(processed/len(shortlist), 1.0))
-    prog2.empty()
+        if callable(update_stage2):
+            update_stage2(processed, total2)
 
     vol_df = pd.DataFrame(stage2_rows)
     if vol_df.empty:
@@ -314,7 +288,6 @@ def rank_top_stocks_all_us(extras_tuple: tuple, top_n: int = TOP_STOCKS, add_etf
     vol_df = vol_df.dropna(subset=["avg_week_volume"]).sort_values("avg_week_volume", ascending=False)
     top_stocks = vol_df.head(top_n).copy()
 
-    # Append ETFs explicitly (no ranking impact)
     if add_etfs:
         etf_rows = []
         for etf in FIXED_ETFS:
@@ -326,13 +299,11 @@ def rank_top_stocks_all_us(extras_tuple: tuple, top_n: int = TOP_STOCKS, add_etf
             except Exception:
                 avgv, last_close = None, None
             etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
-        etf_df = pd.DataFrame(etf_rows)
-        top_full = pd.concat([top_stocks, etf_df], ignore_index=True)
+        top_full = pd.concat([top_stocks, pd.DataFrame(etf_rows)], ignore_index=True)
     else:
         top_full = top_stocks
 
-    top_full = top_full.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
-    return top_full
+    return top_full.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
 
 # =========================
 # IV/FF calculations
@@ -345,11 +316,9 @@ def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     if len(strikes) == 0:
         return None
     atm = float(min(strikes, key=lambda s: abs(float(s) - spot)))
-
     def iv_from(df: pd.DataFrame) -> Optional[float]:
         row = df.loc[df["strike"] == atm]
         return None if row.empty else _first_float(row["impliedVolatility"].iloc[0])
-
     c_iv, p_iv = iv_from(calls), iv_from(puts)
     if c_iv is None and p_iv is None:
         return None
@@ -408,7 +377,6 @@ def screen_ticker(ticker: str) -> List[Dict]:
         return [{"ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
                  "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
                  "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"]}]
-
     ed = [(e, _calc_dte(e)) for e in expiries]
     nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
     e30, e60, e90 = nearest(30), nearest(60), nearest(90)
@@ -417,7 +385,6 @@ def screen_ticker(ticker: str) -> List[Dict]:
     if e30 and e90 and e90[1] > e30[1]: pairs.append(("30–90", e30, e90))
     if e60 and e90 and e90[1] > e60[1]: pairs.append(("60–90", e60, e90))
     earn_dt = get_next_earnings_date(ticker)
-
     rows = []
     for label, (exp1, dte1), (exp2, dte2) in pairs:
         iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
@@ -427,7 +394,6 @@ def screen_ticker(ticker: str) -> List[Dict]:
         T1, T2 = dte1/365.0, dte2/365.0
         fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
         _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
-
         earn_txt, tags = "—", []
         if earn_dt:
             e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
@@ -435,7 +401,6 @@ def screen_ticker(ticker: str) -> List[Dict]:
                 earn_txt, tags = earn_dt.strftime("%Y-%m-%d"), ["earn"]
         if ff and ff >= 0.20:
             tags.append("hot")
-
         rows.append({
             "ticker": ticker, "pair": label,
             "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%",
@@ -481,40 +446,33 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     s = series.copy()
     s_str = s.astype(str).str.strip()
     is_blank = s.isna() | s_str.isin(_BLANK_SET)
-
     pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", "", regex=False), errors="coerce")
     pct_mask = s_str.str.endswith("%") & ~pd.isna(pct_val)
-
     cur_mask = s_str.str.match(r"^\(?\$\s*[\d,]+(?:\.\d+)?\)?$")
     cur_core = (s_str
-                .str.replace(r"^\(", "", regex=True)
-                .str.replace(r"\)$", "", regex=True)
-                .str.replace("$", "", regex=False)
-                .str.replace(",", "", regex=False)
-                .str.strip())
+        .str.replace(r"^\(", "", regex=True)
+        .str.replace(r"\)$", "", regex=True)
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip())
     cur_val = pd.to_numeric(cur_core, errors="coerce")
     cur_neg = s_str.str.startswith("(") & s_str.str.endswith(")")
     cur_val = np.where(cur_neg, -cur_val, cur_val)
-
     num_val_plain = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
     num_key = np.where(~pd.isna(pct_val) & pct_mask, pct_val,
               np.where(~pd.isna(cur_val) & cur_mask, cur_val, num_val_plain))
     num_key = pd.to_numeric(num_key, errors="coerce")
-
     dt = pd.to_datetime(s_str, errors="coerce", utc=True)
     date_key = dt.view("int64")
     text_key = s_str.str.lower()
-
     is_num = ~pd.isna(num_key)
     is_date = pd.isna(num_key) & ~pd.isna(date_key)
     is_text = ~(is_num | is_date)
-
     t_code = np.select([is_num, is_date, is_text], [0, 1, 2], default=2)
     val = pd.Series(np.nan, index=s.index, dtype="object")
     val[is_num] = num_key[is_num]
     val[is_date] = date_key[is_date].astype("float64")
     val[is_text] = text_key[is_text]
-
     grp = np.where(is_blank, 1, 0)
     t_code = np.where(is_blank, 9, t_code)
     val = np.where(is_blank, "", val)
@@ -550,41 +508,69 @@ LABEL_TO_KEY = {v: k for k, v in DISPLAY_MAP.items()}
 DISPLAY_KEYS = ["ticker","pair","exp1","dte1","iv1","exp2","dte2","iv2","fwd_vol","ff","cal_debit","earn_in_window"]
 
 st.title("📈 Forward Volatility Screener (Top 27 by 5-Day Avg Volume — All US Stocks)")
-
 st.markdown(
-    "This scans **all U.S. stocks (NASDAQ + NYSE/AMEX)** in two stages, ranks by **average volume over the last 5 completed sessions**, "
+    "Two-stage scan across **NASDAQ + NYSE/AMEX**. Ranks by **avg volume over the last 5 completed sessions**, "
     f"selects the **Top {TOP_STOCKS} stocks**, and {'adds **VOO, SPY, QQQ**' if ADD_ETFS else 'does not add ETFs'}."
 )
 
 raw_extra = st.text_input("Optional: Add tickers (comma/space separated)", "", placeholder="e.g., NVDA, TSLA, META")
 
-# --- The button now always triggers immediate visual feedback via Stage 1 progress bar ---
+def _start_run():
+    st.session_state.go = True
+
 colA, colB = st.columns([1, 3])
 with colA:
-    run = st.button("Build List & Run", type="primary", help="Two-stage fast scan across the US universe")
+    st.button("Build List & Run", type="primary", help="Two-stage fast scan across the US universe", on_click=_start_run)
 with colB:
     st.caption("Excludes today's partial volume until after the 4:05pm ET close.")
 
-if run:
-    extras = tuple(_normalize_tickers(raw_extra))  # tuple → cache-friendly
-    vol_top_df = rank_top_stocks_all_us(extras, top_n=TOP_STOCKS, add_etfs=ADD_ETFS)
+# ---------- MAIN EXECUTION PIPELINE (triggered by stable flag) ----------
+if st.session_state.go:
+    extras = _normalize_tickers(raw_extra)
+
+    # Progress bars outside cached functions
+    prog1 = st.progress(0.0, text="Stage 1/2: Scanning universe (latest volumes)…")
+    prog2 = st.progress(0.0, text="Stage 2/2: Computing 5-day average on shortlist…")
+
+    def up1(done, total):
+        prog1.progress(min(done/total, 1.0), text=f"Stage 1/2: {done}/{total} tickers processed…")
+
+    def up2(done, total):
+        prog2.progress(min(done/total, 1.0), text=f"Stage 2/2: {done}/{total} tickers processed…")
+
+    with st.spinner("Building list…"):
+        vol_top_df = rank_top_stocks_all_us_pipeline(
+            extras=extras,
+            top_n=TOP_STOCKS,
+            add_etfs=ADD_ETFS,
+            update_stage1=up1,
+            update_stage2=up2,
+        )
+
+    prog1.empty()
+    prog2.empty()
+
     st.session_state.vol_topN = vol_top_df
-    tickers = vol_top_df["ticker"].tolist()
-    st.session_state.tickers = tickers
-    st.session_state.df = scan_many(tickers)
+    st.session_state.tickers = vol_top_df["ticker"].tolist() if not vol_top_df.empty else []
+    # run screener only if we have symbols
+    if st.session_state.tickers:
+        with st.spinner("Scanning option chains…"):
+            st.session_state.df = scan_many(st.session_state.tickers)
+    else:
+        st.session_state.df = pd.DataFrame()
+
+    # reset run flag after completion
+    st.session_state.go = False
 
 # --------- Selected list (stocks + optional ETFs) ---------
 if st.session_state.vol_topN is not None and not st.session_state.vol_topN.empty:
     st.subheader(f"Selected Tickers (Top {TOP_STOCKS} Stocks by 5-Day Avg Vol{' + ETFs' if ADD_ETFS else ''})")
     base = st.session_state.vol_topN.copy()
-    # Order: Stocks first, then ETFs
     source_order = pd.api.types.CategoricalDtype(categories=["Stock", "ETF"], ordered=True)
     base["Source"] = base["source"].astype(source_order)
     base["SourceOrder"] = base["Source"].cat.codes
     base["AvgVolNum"] = pd.to_numeric(base["avg_week_volume"], errors="coerce")
-
     base = base.sort_values(by=["SourceOrder", "AvgVolNum"], ascending=[True, False], kind="mergesort")
-
     disp = pd.DataFrame({
         "Ticker": base["ticker"],
         "Avg Vol (5d)": base["AvgVolNum"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "—"),
@@ -612,7 +598,6 @@ else:
 
     sort_key = LABEL_TO_KEY.get(sort_label, "ff")
     df_sorted = sort_df(df_current, sort_key, sort_ascending)
-
     have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
     df_display = df_sorted[have_keys].copy()
     df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
