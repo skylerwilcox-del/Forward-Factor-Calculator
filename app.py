@@ -396,7 +396,7 @@ st.title("📈 Forward Volatility Screener")
 
 raw = st.text_area(
     "Tickers (comma / space separated):",
-    "AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, NFLX, AMD, AVGO",
+    "AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, NFLX, AMD, AVGO, SPY, VOO, RIVN",
     height=96,
 )
 
@@ -488,3 +488,4 @@ else:
         "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
         unsafe_allow_html=True,
     )
+
