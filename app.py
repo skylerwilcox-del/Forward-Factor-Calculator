@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # App/session setup
 # =========================
 PACIFIC = pytz.timezone("America/Los_Angeles")
-st.set_page_config(page_title="Forward Vol Screener — Top 30 by Volume", layout="wide")
+st.set_page_config(page_title="Forward Vol Screener — Top 27 Stocks + 3 ETFs", layout="wide")
 
 # Persist results across reruns
 for k in ("df", "tickers", "vol_top30"):
@@ -36,15 +36,8 @@ DISPLAY_MAP = {
     "earn_in_window": "Earnings Date",
 }
 LABEL_TO_KEY = {v: k for k, v in DISPLAY_MAP.items()}
+DISPLAY_KEYS = ["ticker","pair","exp1","dte1","iv1","exp2","dte2","iv2","fwd_vol","ff","cal_debit","earn_in_window"]
 
-# Order to display (and sort on)
-DISPLAY_KEYS = [
-    "ticker", "pair", "exp1", "dte1", "iv1",
-    "exp2", "dte2", "iv2", "fwd_vol", "ff",
-    "cal_debit", "earn_in_window"
-]
-
-# Concurrency
 MAX_WORKERS = 12
 
 # =========================
@@ -235,70 +228,88 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
 # =========================
 # Universe & Top-30 selector
 # =========================
-DEFAULT_ETFS = [
-    # Broad index & liquid sector/theme ETFs
-    "SPY","QQQ","IWM","DIA","VTI","VOO","IVV","SPLG",
-    "XLK","XLF","XLV","XLY","XLP","XLE","XLI","XLU","XLB",
-    "ARKK","SMH","SOXX","TLT","HYG","LQD","BITO","GLD","SLV","USO"
-]
+FIXED_ETFS = ["VOO", "SPY", "QQQ"]
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def get_universe() -> List[str]:
-    tickers = []
-    # Try to pull S&P500 from yfinance
+def get_sp500_universe() -> List[str]:
+    # S&P 500 component tickers only (stocks)
     try:
         spx = yf.tickers_sp500()
-        if isinstance(spx, (list, tuple)) and len(spx) > 0:
-            tickers.extend(spx)
+        # yfinance returns list-like of tickers
+        if isinstance(spx, (list, tuple)) and spx:
+            return [t.strip().upper() for t in spx if t]
     except Exception:
         pass
-    # Always include a basket of very liquid ETFs
-    tickers.extend(DEFAULT_ETFS)
-    # De-dup and keep order
-    seen, out = set(), []
-    for t in tickers:
-        t = t.strip().upper()
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+    # Fallback: if retrieval fails, use a small liquid subset so app still runs
+    return ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","BRK-B","TSLA","LLY","AVGO","JPM","XOM","UNH","V","MA","WMT","PG","HD","COST","BAC",
+            "NFLX","CRM","KO","PEP","CSCO","ABBV","ADBE"]
 
 def _avg_vol_worker(t: str) -> Tuple[str, Optional[float]]:
     return t, get_avg_week_volume(t)
 
 @st.cache_data(ttl=600, show_spinner=False)
-def select_top30_by_volume(extra: List[str]) -> pd.DataFrame:
+def select_top27_stocks_plus_3_etfs(extra: List[str]) -> pd.DataFrame:
     """
-    Build Top-30 by 1-week avg volume from S&P500 + default ETFs + user extras.
-    Returns a DataFrame with columns: ticker, avg_week_volume, last_close.
+    1) Rank S&P500 stocks by 1-week avg volume → pick top 27.
+    2) Add exactly VOO, SPY, QQQ.
+    3) Append optional user extras (de-duped).
+    Returns columns: ticker, avg_week_volume, last_close, source
     """
-    universe = get_universe()
-    # Add user-provided extras (if any)
-    for e in extra:
-        if e not in universe:
-            universe.append(e)
+    stock_uni = get_sp500_universe()
 
+    # Rank stocks by 1-week avg vol
     rows = []
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(4, len(universe)//30))) as ex:
-        futs = {ex.submit(_avg_vol_worker, t): t for t in universe}
-        progress = st.progress(0.0, text="Ranking by 1-week average volume…")
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(4, len(stock_uni)//30))) as ex:
+        futs = {ex.submit(_avg_vol_worker, t): t for t in stock_uni}
+        progress = st.progress(0.0, text="Ranking S&P 500 by 1-week average volume…")
         done = 0
         for fut in as_completed(futs):
             t, avgv = fut.result()
-            rows.append({"ticker": t, "avg_week_volume": avgv})
+            rows.append({"ticker": t, "avg_week_volume": avgv, "source": "S&P500"})
             done += 1
-            progress.progress(done/len(universe))
+            progress.progress(done/len(stock_uni))
         progress.empty()
 
-    vol_df = pd.DataFrame(rows)
-    vol_df = vol_df.dropna(subset=["avg_week_volume"]).sort_values("avg_week_volume", ascending=False).head(30).reset_index(drop=True)
+    stocks_df = (pd.DataFrame(rows)
+                 .dropna(subset=["avg_week_volume"])
+                 .sort_values("avg_week_volume", ascending=False)
+                 .head(27)
+                 .reset_index(drop=True))
 
-    # Add a price column for context (non-blocking sequential to keep API load low)
+    # Add ETFs with their vols (for display context)
+    etf_rows = []
+    for etf in FIXED_ETFS:
+        etf_rows.append({
+            "ticker": etf,
+            "avg_week_volume": get_avg_week_volume(etf),
+            "source": "ETF"
+        })
+    etf_df = pd.DataFrame(etf_rows)
+
+    # Compose Top 30 (27 stocks + 3 ETFs)
+    top30 = pd.concat([stocks_df, etf_df], ignore_index=True)
+
+    # Add last_close for context
     prices = []
-    for t in vol_df["ticker"]:
+    for t in top30["ticker"]:
         prices.append(get_close_price(t))
-    vol_df["last_close"] = prices
-    return vol_df
+    top30["last_close"] = prices
+
+    # De-dup with stocks preferred over ETFs if name overlaps (shouldn't happen, but safe)
+    top30 = top30.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
+
+    # Append user extras (no volume ranking; tagged as 'Extra')
+    if extra:
+        extra_clean = [e for e in extra if e not in set(top30["ticker"].tolist())]
+        for x in extra_clean:
+            top30.loc[len(top30)] = {
+                "ticker": x,
+                "avg_week_volume": get_avg_week_volume(x),
+                "last_close": get_close_price(x),
+                "source": "Extra"
+            }
+
+    return top30
 
 # =========================
 # Screener (cached per ticker)
@@ -307,23 +318,14 @@ def select_top30_by_volume(extra: List[str]) -> pd.DataFrame:
 def screen_ticker(ticker: str) -> List[Dict]:
     spot = get_spot(ticker)
     if spot is None:
-        return [{
-            "ticker": ticker, "pair": "—",
-            "exp1": "—", "dte1": "—", "iv1": "—",
-            "exp2": "—", "dte2": "—", "iv2": "—",
-            "fwd_vol": "—", "ff": "—", "cal_debit": "—",
-            "earn_in_window": "—", "_tags": ["no_spot"]
-        }]
-
+        return [{"ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
+                 "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
+                 "cal_debit": "—","earn_in_window": "—","_tags": ["no_spot"]}]
     expiries = get_options(ticker)
     if not expiries:
-        return [{
-            "ticker": ticker, "pair": "—",
-            "exp1": "—", "dte1": "—", "iv1": "—",
-            "exp2": "—", "dte2": "—", "iv2": "—",
-            "fwd_vol": "—", "ff": "—", "cal_debit": "—",
-            "earn_in_window": "—", "_tags": ["no_exp"]
-        }]
+        return [{"ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
+                 "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
+                 "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"]}]
 
     ed = [(e, _calc_dte(e)) for e in expiries]
     nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
@@ -339,8 +341,8 @@ def screen_ticker(ticker: str) -> List[Dict]:
         iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
         if iv1 is None or iv2 is None:
             continue
-        s1, s2 = iv1 / 100.0, iv2 / 100.0
-        T1, T2 = dte1 / 365.0, dte2 / 365.0
+        s1, s2 = iv1/100.0, iv2/100.0
+        T1, T2 = dte1/365.0, dte2/365.0
         fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
         _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
 
@@ -353,8 +355,7 @@ def screen_ticker(ticker: str) -> List[Dict]:
             tags.append("hot")
 
         rows.append({
-            "ticker": ticker,
-            "pair": label,
+            "ticker": ticker, "pair": label,
             "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%",
             "exp2": exp2, "dte2": dte2, "iv2": f"{iv2:.2f}%",
             "fwd_vol": f"{(fwd_sigma*100):.2f}%" if fwd_sigma else "—",
@@ -369,7 +370,6 @@ def scan_many(tickers: List[str]) -> pd.DataFrame:
     rows: List[Dict] = []
     if not tickers:
         return pd.DataFrame(rows)
-
     progress = st.progress(0.0, text="Scanning option chains…")
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(tickers)))) as ex:
         fut_map = {ex.submit(screen_ticker, t): t for t in tickers}
@@ -379,24 +379,19 @@ def scan_many(tickers: List[str]) -> pd.DataFrame:
             try:
                 rows.extend(fut.result())
             except Exception as e:
-                rows.append({
-                    "ticker": t, "pair": "—",
-                    "exp1": "—", "dte1": "—", "iv1": "—",
-                    "exp2": "—", "dte2": "—", "iv2": "—",
-                    "fwd_vol": "—", "ff": "—", "cal_debit": "—",
-                    "earn_in_window": "—", "_tags": [f"error:{type(e).__name__}"]
-                })
+                rows.append({"ticker": t, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
+                             "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
+                             "cal_debit": "—","earn_in_window": "—","_tags": [f"error:{type(e).__name__}"]})
             done += 1
-            progress.progress(done / len(tickers), text=f"Scanned {t} ({done}/{len(tickers)})")
+            progress.progress(done/len(tickers), text=f"Scanned {t} ({done}/{len(tickers)})")
     progress.empty()
-
     df = pd.DataFrame(rows)
     if "_tags" not in df.columns:
         df["_tags"] = [[] for _ in range(len(df))]
     return df
 
 # =========================
-# Robust, vectorized sorting
+# Robust sorting
 # =========================
 _BLANK_SET = {"", "-", "—", "–"}
 
@@ -420,14 +415,12 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     cur_val = np.where(cur_neg, -cur_val, cur_val)
 
     num_val_plain = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
-
     num_key = np.where(~pd.isna(pct_val) & pct_mask, pct_val,
               np.where(~pd.isna(cur_val) & cur_mask, cur_val, num_val_plain))
     num_key = pd.to_numeric(num_key, errors="coerce")
 
     dt = pd.to_datetime(s_str, errors="coerce", utc=True)
     date_key = dt.view("int64")
-
     text_key = s_str.str.lower()
 
     is_num = ~pd.isna(num_key)
@@ -435,7 +428,6 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     is_text = ~(is_num | is_date)
 
     t_code = np.select([is_num, is_date, is_text], [0, 1, 2], default=2)
-
     val = pd.Series(np.nan, index=s.index, dtype="object")
     val[is_num] = num_key[is_num]
     val[is_date] = date_key[is_date].astype("float64")
@@ -444,65 +436,60 @@ def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     grp = np.where(is_blank, 1, 0)
     t_code = np.where(is_blank, 9, t_code)
     val = np.where(is_blank, "", val)
-
     return pd.DataFrame({"_grp": grp, "_t": t_code, "_val": val}, index=s.index)
 
 def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
     if df is None or df.empty or col not in df.columns:
         return df
     aux = _build_sort_columns(df[col])
-    out = (
-        df.join(aux)
-          .sort_values(by=["_grp", "_t", "_val"], ascending=[True, True, ascending], kind="mergesort")
-          .drop(columns=["_grp", "_t", "_val"])
-          .reset_index(drop=True)
-    )
-    return out
+    return (df.join(aux)
+              .sort_values(by=["_grp","_t","_val"], ascending=[True, True, ascending], kind="mergesort")
+              .drop(columns=["_grp","_t","_val"])
+              .reset_index(drop=True))
 
 # =========================
 # UI
 # =========================
-st.title("📈 Forward Volatility Screener (Top 30 by 1-Week Avg Volume)")
+st.title("📈 Forward Volatility Screener (Top 27 Stocks + VOO, SPY, QQQ)")
 
-st.markdown("The app automatically finds the **Top 30 most-traded stocks/ETFs by 1-week average volume** and scans those. Optionally add more tickers below.")
+st.markdown("The app automatically finds the **Top 27 S&P 500 stocks by 1-week average volume**, "
+            "adds **VOO, SPY, QQQ**, and scans those 30 tickers. Optionally add more tickers below.")
 
-# User extras are optional
 raw_extra = st.text_input("Optional: Add tickers (comma/space separated)", "", placeholder="e.g., NVDA, TSLA, META")
 
-auto_col1, auto_col2 = st.columns([1, 3])
-with auto_col1:
-    run = st.button("Find Top 30 & Run", type="primary")
-with auto_col2:
-    st.caption("Ranking source universe: S&P 500 + a basket of highly liquid ETFs")
+colA, colB = st.columns([1, 3])
+with colA:
+    run = st.button("Build List & Run", type="primary")
+with colB:
+    st.caption("Universe for ranking = S&P 500 (stocks only) • ETFs added: VOO, SPY, QQQ")
 
-# Build & persist Top 30 → then run screener
 if run:
-    extra = _normalize_tickers(raw_extra)
-    vol_top30_df = select_top30_by_volume(extra)
+    extras = _normalize_tickers(raw_extra)
+    vol_top30_df = select_top27_stocks_plus_3_etfs(extras)
     st.session_state.vol_top30 = vol_top30_df
     tickers = vol_top30_df["ticker"].tolist()
     st.session_state.tickers = tickers
     st.session_state.df = scan_many(tickers)
 
-# Show the selected Top 30 list (with volumes)
+# Show the selected list (stocks first, then ETFs, then Extras)
 if st.session_state.vol_top30 is not None and not st.session_state.vol_top30.empty:
-    st.subheader("Top 30 by 1-Week Average Volume")
-    top30_disp = st.session_state.vol_top30.rename(columns={
-        "ticker": "Ticker",
-        "avg_week_volume": "Avg Vol (5d)",
-        "last_close": "Last Close"
-    }).copy()
-    # Pretty formatting
-    top30_disp["Avg Vol (5d)"] = top30_disp["Avg Vol (5d)"].map(lambda v: f"{int(v):,}")
-    top30_disp["Last Close"] = top30_disp["Last Close"].map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
-    st.dataframe(top30_disp, use_container_width=True, hide_index=True)
+    st.subheader("Selected Tickers (Top 27 Stocks by 1-Week Avg Vol + VOO/SPY/QQQ)")
+    disp = st.session_state.vol_top30.copy()
+    # Nice formatting
+    disp = disp.rename(columns={"ticker":"Ticker","avg_week_volume":"Avg Vol (5d)","last_close":"Last Close","source":"Source"})
+    disp["Avg Vol (5d)"] = disp["Avg Vol (5d)"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "—")
+    disp["Last Close"] = disp["Last Close"].apply(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
+    # Sort display by Source order: S&P500 (stock) first, ETF second, Extra last; within each, by volume desc
+    source_order = pd.CategoricalDtype(categories=["S&P500","ETF","Extra"], ordered=True)
+    disp["Source"] = disp["Source"].astype(source_order)
+    disp = disp.sort_values(by=["Source", "Avg Vol (5d)"], ascending=[True, False], key=lambda s: s if s.dtype==source_order else None)
+    st.dataframe(disp, use_container_width=True, hide_index=True)
 
 # --------- Render forward-vol table ---------
 df_current = st.session_state.df
 if df_current is None or df_current.empty:
-    st.info("Click **Find Top 30 & Run** to rank by volume and scan options.")
+    st.info("Click **Build List & Run** to rank stocks, add ETFs, and scan options.")
 else:
-    # Sorting controls use friendly labels
     display_labels = [DISPLAY_MAP[k] for k in DISPLAY_KEYS if k in df_current.columns]
     default_label = DISPLAY_MAP.get("ff", display_labels[0])
 
@@ -518,12 +505,10 @@ else:
     sort_key = LABEL_TO_KEY.get(sort_label, "ff")
     df_sorted = sort_df(df_current, sort_key, sort_ascending)
 
-    # Build display df: drop _tags and rename headers
     have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
     df_display = df_sorted[have_keys].copy()
     df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
 
-    # Row highlighting based on hidden _tags (kept in df_sorted)
     tags_series = df_sorted["_tags"] if "_tags" in df_sorted.columns else pd.Series([[]]*len(df_sorted), index=df_sorted.index)
 
     def _highlight_row(row: pd.Series):
@@ -532,30 +517,25 @@ else:
         hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
         color = "#ffffff"
         if earn and hot:
-            color = "#ffe0b2"   # both
+            color = "#ffe0b2"
         elif earn:
-            color = "#fff9c4"   # earnings
+            color = "#fff9c4"
         elif hot:
-            color = "#dcedc8"   # hot
+            color = "#dcedc8"
         return [f"background-color:{color}; color:#000000;"] * len(row)
 
-    styled = (
-        df_display.style
-            .apply(_highlight_row, axis=1)
-            .set_properties(**{"border": "1px solid #bbb", "color": "#000", "font-size": "14px"})
-    )
+    styled = (df_display.style
+              .apply(_highlight_row, axis=1)
+              .set_properties(**{"border":"1px solid #bbb","color":"#000","font-size":"14px"}))
 
-    st.markdown(
-        """
+    st.markdown("""
         <style>
         table {border-collapse: collapse; width: 100%;}
         th {position: sticky; top: 0; background-color: #f0f0f0; color: #000; font-weight: bold;}
         tr:nth-child(even) {background-color: #fafafa;}
         tr:hover {background-color: #e0e0e0;}
         </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    """, unsafe_allow_html=True)
 
     st.markdown(styled.to_html(), unsafe_allow_html=True)
     st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
