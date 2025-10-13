@@ -8,6 +8,7 @@ import pytz
 import streamlit as st
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 
 # =========================
 # App/session setup
@@ -17,25 +18,29 @@ EASTERN = pytz.timezone("America/New_York")
 st.set_page_config(page_title="Forward Vol Screener — Top 27 (All US Stocks)", layout="wide")
 
 # Persistent session state
-if "df" not in st.session_state:
-    st.session_state.df = None
-if "tickers" not in st.session_state:
-    st.session_state.tickers = []
-if "vol_topN" not in st.session_state:
-    st.session_state.vol_topN = None
-if "trigger_run" not in st.session_state:
-    st.session_state.trigger_run = False
+st.session_state.setdefault("df", None)
+st.session_state.setdefault("tickers", [])
+st.session_state.setdefault("vol_topN", None)
+st.session_state.setdefault("trigger_run", False)
 
 # --- Config ---
-TOP_STOCKS = 27            # number of stocks to select
-ADD_ETFS = True            # set False to omit ETFs
+TOP_STOCKS = 27
+ADD_ETFS = True
 FIXED_ETFS = ["VOO", "SPY", "QQQ"]
-MAX_WORKERS = 12           # options-chain parallelism
+MAX_WORKERS = 12
 
 # Download tuning
-DL_CHUNK_STAGE1 = 80       # small chunks → responsive UI for the quick pass
-DL_CHUNK_STAGE2 = 50       # shortlist chunks (heavier columns, keep small)
-SHORTLIST_SIZE = 400       # how many symbols to carry to the accurate pass
+DL_CHUNK_STAGE1 = 80
+DL_CHUNK_STAGE2 = 50
+SHORTLIST_SIZE = 400
+
+# A hard fallback list of liquid US tickers (ensures app never returns empty)
+FALLBACK_LIQUID = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","AMD","NFLX","CRM","COST","PEP",
+    "ADBE","INTC","UBER","JPM","BAC","XOM","CVX","KO","PFE","WMT","T","ORCL","QCOM","V","MA","PYPL",
+    "WFC","GE","NKE","MRNA","DIS","BA","MU","PLTR","SOFI","CCL","NIO","RIVN","LCID","F","GM","SNAP",
+    "SQ","SHOP","ABNB","MMM","IBM","VZ","CSCO","AMAT","TSM","BABA","BIDU","PDD","RIO","TQQQ","SQQQ"
+]
 
 # =========================
 # Helpers
@@ -83,8 +88,13 @@ def _normalize_tickers(raw: str) -> List[str]:
             out.append(t)
     return out
 
+def _is_clean_us_symbol(sym: str) -> bool:
+    # Allow letters/digits and a single hyphen; exclude weird/OTC/indices/units, etc.
+    # (yfinance can choke on many exotic/non-US formats)
+    return bool(re.fullmatch(r"[A-Z0-9]{1,5}(-[A-Z0-9]{1,2})?", sym))
+
 # =========================
-# yfinance (cached data helpers — NO st.* inside)
+# yfinance (cached data)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def get_spot(ticker: str) -> Optional[float]:
@@ -100,6 +110,7 @@ def get_spot(ticker: str) -> Optional[float]:
 def get_options(ticker: str) -> List[str]:
     try:
         opts = yf.Ticker(ticker).options or []
+        # yfinance returns 'YYYY-MM-DD' strings
         return [e for e in opts if isinstance(e, str) and len(e) == 10 and e[4] == "-" and e[7] == "-"]
     except Exception:
         return []
@@ -139,37 +150,31 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
     return None
 
 # =========================
-# Universe and downloads (NO st.* here)
+# Universe and downloads
 # =========================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_us_stock_universe() -> List[str]:
-    tickers = []
-    try:
-        nas = getattr(yf, "tickers_nasdaq", None)
-        if callable(nas):
-            r = nas()
-            if isinstance(r, (list, tuple)) and r:
-                tickers.extend([t.strip().upper() for t in r if t])
-    except Exception:
-        pass
-    try:
-        oth = getattr(yf, "tickers_other", None)
-        if callable(oth):
-            r = oth()
-            if isinstance(r, (list, tuple)) and r:
-                tickers.extend([t.strip().upper() for t in r if t])
-    except Exception:
-        pass
-    if not tickers:
+    candidates: List[str] = []
+    # Try yfinance helpers (when available in the runtime)
+    for fn_name in ["tickers_nasdaq", "tickers_other", "tickers_sp500"]:
         try:
-            spx = getattr(yf, "tickers_sp500", None)
-            if callable(spx):
-                r = spx()
-                if isinstance(r, (list, tuple)) and r:
-                    tickers.extend([t.strip().upper() for t in r if t])
+            fn = getattr(yf, fn_name, None)
+            if callable(fn):
+                vals = fn()
+                if isinstance(vals, (list, tuple)):
+                    candidates.extend([str(t).strip().upper() for t in vals if t])
         except Exception:
-            pass
-    return sorted(set(tickers))
+            continue
+
+    # De-dup and sanitize
+    candidates = [t for t in dict.fromkeys(candidates) if _is_clean_us_symbol(t)]
+
+    # Hard fallback if nothing came back (or if environment blocks those helpers)
+    if not candidates:
+        candidates = FALLBACK_LIQUID.copy()
+
+    # Make sure it’s not empty
+    return list(dict.fromkeys(candidates))
 
 def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -199,6 +204,8 @@ def _chunks(lst, n):
         yield lst[i:i+n]
 
 def _safe_multi_download(tickers, period, interval):
+    if not tickers:
+        return pd.DataFrame()
     try:
         return yf.download(
             tickers=tickers,
@@ -212,21 +219,23 @@ def _safe_multi_download(tickers, period, interval):
     except Exception:
         return pd.DataFrame()
 
-# ---------- Two-stage ranker (UI controls/progress handled OUTSIDE) ----------
+# ---------- Two-stage ranker ----------
 def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: bool,
                                     update_stage1=None, update_stage2=None) -> pd.DataFrame:
     universe = get_us_stock_universe()
+    # Add any user extras
     for e in extras:
-        if e not in universe:
+        e = e.strip().upper()
+        if _is_clean_us_symbol(e) and e not in universe:
             universe.append(e)
 
-    # Stage 1: shortlist by last completed session volume
+    # Stage 1 — shortlist by last session volume
     stage1_rows = []
     processed = 0
     total = len(universe)
     for block in _chunks(universe, DL_CHUNK_STAGE1):
         data = _safe_multi_download(block, period="7d", interval="1d")
-        got = [c[0] for c in data.columns.unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
+        got = [c[0] for c in getattr(data, "columns", pd.Index([])).unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
         for t in got:
             try:
                 sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
@@ -244,19 +253,49 @@ def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: boo
         if callable(update_stage1):
             update_stage1(processed, total)
 
+    # If Stage 1 somehow empty, hard fallback to our liquid list and retry once
     if not stage1_rows:
-        return pd.DataFrame(columns=["ticker","avg_week_volume","last_close","source"])
+        for block in _chunks(FALLBACK_LIQUID, DL_CHUNK_STAGE1):
+            data = _safe_multi_download(block, period="7d", interval="1d")
+            if data is None or data.empty:
+                continue
+            got = [c[0] for c in data.columns.unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
+            for t in got:
+                try:
+                    sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+                    sub = _exclude_today_if_open(sub)
+                    if "Volume" not in sub.columns or sub["Volume"].dropna().empty:
+                        continue
+                    last_vol = float(sub["Volume"].dropna().iloc[-1])
+                    last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+                    stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
+                except Exception:
+                    continue
+
+    if not stage1_rows:
+        # still empty; return ETFs only so the app shows *something*
+        etf_rows = []
+        for etf in FIXED_ETFS:
+            try:
+                hist = yf.download(etf, period="20d", interval="1d", auto_adjust=False, progress=False)
+                hist = _exclude_today_if_open(hist)
+                avgv = _avg5(hist["Volume"]) if "Volume" in hist.columns else None
+                last_close = float(hist["Close"].dropna().iloc[-1]) if "Close" in hist.columns and not hist["Close"].dropna().empty else None
+                etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
+            except Exception:
+                continue
+        return pd.DataFrame(etf_rows)
 
     stage1 = pd.DataFrame(stage1_rows).dropna(subset=["last_vol"]).sort_values("last_vol", ascending=False)
     shortlist = stage1["ticker"].head(SHORTLIST_SIZE).tolist()
 
-    # Stage 2: accurate 5-day average on shortlist
+    # Stage 2 — accurate 5-day average on shortlist
     stage2_rows = []
     processed = 0
     total2 = len(shortlist)
     for block in _chunks(shortlist, DL_CHUNK_STAGE2):
         data = _safe_multi_download(block, period="20d", interval="1d")
-        got = [c[0] for c in data.columns.unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
+        got = [c[0] for c in getattr(data, "columns", pd.Index([])).unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
         for t in got:
             try:
                 sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
@@ -276,12 +315,35 @@ def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: boo
 
     vol_df = pd.DataFrame(stage2_rows)
     if vol_df.empty:
+        # as a fallback, compute 5d on FALLBACK_LIQUID
+        for block in _chunks(FALLBACK_LIQUID, DL_CHUNK_STAGE2):
+            data = _safe_multi_download(block, period="20d", interval="1d")
+            if data is None or data.empty:
+                continue
+            got = [c[0] for c in data.columns.unique(level=0)] if isinstance(data.columns, pd.MultiIndex) else block
+            for t in got:
+                try:
+                    sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+                    sub = _exclude_today_if_open(sub)
+                    if "Volume" not in sub.columns:
+                        continue
+                    avgv = _avg5(sub["Volume"])
+                    if avgv is None:
+                        continue
+                    last_close = float(sub["Close"].dropna().iloc[-1])
+                    vol_df = pd.concat([vol_df, pd.DataFrame([{
+                        "ticker": t, "avg_week_volume": avgv, "last_close": last_close, "source": "Stock"
+                    }])], ignore_index=True)
+                except Exception:
+                    continue
+
+    if vol_df.empty:
         return pd.DataFrame(columns=["ticker","avg_week_volume","last_close","source"])
 
     vol_df = vol_df.dropna(subset=["avg_week_volume"]).sort_values("avg_week_volume", ascending=False)
     top_stocks = vol_df.head(top_n).copy()
 
-    if add_etfs:
+    if ADD_ETFS:
         etf_rows = []
         for etf in FIXED_ETFS:
             try:
@@ -289,9 +351,9 @@ def rank_top_stocks_all_us_pipeline(extras: List[str], top_n: int, add_etfs: boo
                 hist = _exclude_today_if_open(hist)
                 avgv = _avg5(hist["Volume"]) if "Volume" in hist.columns else None
                 last_close = float(hist["Close"].dropna().iloc[-1]) if "Close" in hist.columns and not hist["Close"].dropna().empty else None
+                etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
             except Exception:
-                avgv, last_close = None, None
-            etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
+                etf_rows.append({"ticker": etf, "avg_week_volume": None, "last_close": None, "source": "ETF"})
         top_full = pd.concat([top_stocks, pd.DataFrame(etf_rows)], ignore_index=True)
     else:
         top_full = top_stocks
@@ -305,13 +367,17 @@ def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     calls, puts = get_chain(ticker, expiry)
     if calls.empty and puts.empty:
         return None
-    strikes = pd.Index(sorted(set(calls["strike"]).union(set(puts["strike"]))))
+    strikes = pd.Index(sorted(set(calls["strike"]).union(set(puts["strike"])))).astype(float)
     if len(strikes) == 0:
         return None
-    atm = float(min(strikes, key=lambda s: abs(float(s) - spot)))
+    atm = float(min(strikes, key=lambda s: abs(s - spot)))
+
     def iv_from(df: pd.DataFrame) -> Optional[float]:
-        row = df.loc[df["strike"] == atm]
+        if df is None or df.empty:
+            return None
+        row = df.loc[df["strike"].astype(float) == atm]
         return None if row.empty else _first_float(row["impliedVolatility"].iloc[0])
+
     c_iv, p_iv = iv_from(calls), iv_from(puts)
     if c_iv is None and p_iv is None:
         return None
@@ -324,13 +390,15 @@ def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
 def common_atm_strike(ticker: str, exp1: str, exp2: str, spot: float) -> Optional[float]:
     c1, p1 = get_chain(ticker, exp1)
     c2, p2 = get_chain(ticker, exp2)
-    s1 = set(map(float, pd.Index(sorted(set(c1["strike"]).union(set(p1["strike"]))))))
-    s2 = set(map(float, pd.Index(sorted(set(c2["strike"]).union(set(p2["strike"]))))))
+    s1 = set(map(float, pd.Index(sorted(set(c1["strike"]).union(set(p1["strike"])))))) if not (c1.empty and p1.empty) else set()
+    s2 = set(map(float, pd.Index(sorted(set(c2["strike"]).union(set(p2["strike"])))))) if not (c2.empty and p2.empty) else set()
     inter = list(s1.intersection(s2))
     return float(min(inter, key=lambda s: abs(s - spot))) if inter else None
 
 def call_mid_at(calls: pd.DataFrame, strike: float) -> Optional[float]:
-    row = calls.loc[calls["strike"] == strike]
+    if calls is None or calls.empty:
+        return None
+    row = calls.loc[calls["strike"].astype(float) == strike]
     return None if row.empty else _safe_mid(row.iloc[0])
 
 def calendar_debit(ticker: str, e1: str, e2: str, spot: float):
@@ -356,7 +424,7 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
     return fwd_sigma, ff
 
 # =========================
-# Screener (per ticker; cached)
+# Screener (per ticker)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
@@ -431,7 +499,7 @@ def scan_many(tickers: List[str]) -> pd.DataFrame:
     return df
 
 # =========================
-# Robust sorting helpers for the main table
+# Sorting helpers
 # =========================
 _BLANK_SET = {"", "-", "—", "–"}
 
@@ -517,17 +585,15 @@ with colA:
 with colB:
     st.caption("Excludes today's partial volume until after the 4:05pm ET close.")
 
-# ---------- MAIN EXECUTION PIPELINE (triggered by stable flag) ----------
+# ---------- MAIN EXECUTION ----------
 if st.session_state.trigger_run:
     extras = _normalize_tickers(raw_extra)
 
-    # Progress bars outside cached functions
     prog1 = st.progress(0.0, text="Stage 1/2: Scanning universe (latest volumes)…")
     prog2 = st.progress(0.0, text="Stage 2/2: Computing 5-day average on shortlist…")
 
     def up1(done, total):
         prog1.progress(min(done/total, 1.0), text=f"Stage 1/2: {done}/{total} tickers processed…")
-
     def up2(done, total):
         prog2.progress(min(done/total, 1.0), text=f"Stage 2/2: {done}/{total} tickers processed…")
 
@@ -546,23 +612,20 @@ if st.session_state.trigger_run:
     st.session_state.vol_topN = vol_top_df
     st.session_state.tickers = vol_top_df["ticker"].tolist() if not vol_top_df.empty else []
 
-    # Run the options/FF screener immediately and store results
     if st.session_state.tickers:
         with st.spinner("Scanning option chains…"):
             st.session_state.df = scan_many(st.session_state.tickers)
         st.success("✅ Scan complete! Results displayed below.")
     else:
         st.session_state.df = pd.DataFrame()
-        st.warning("No tickers selected. Try adding explicit symbols or rerun later.")
+        st.warning("No tickers selected by the ranking step (API limits or market closed). Using the input box above can help.")
 
-    # reset run flag after completion
     st.session_state.trigger_run = False
 
 # --------- Selected list (stocks + optional ETFs) ---------
 if st.session_state.vol_topN is not None and not st.session_state.vol_topN.empty:
     st.subheader(f"Selected Tickers (Top {TOP_STOCKS} Stocks by 5-Day Avg Vol{' + ETFs' if ADD_ETFS else ''})")
     base = st.session_state.vol_topN.copy()
-    # Stable ordering: Stocks first, then ETFs; within group by avg vol desc
     source_order = pd.api.types.CategoricalDtype(categories=["Stock", "ETF"], ordered=True)
     base["Source"] = base["source"].astype(source_order)
     base["SourceOrder"] = base["Source"].cat.codes
@@ -576,7 +639,7 @@ if st.session_state.vol_topN is not None and not st.session_state.vol_topN.empty
     })
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
-# --------- Forward-vol table (ALWAYS show current df if available) ---------
+# --------- Forward-vol table ---------
 df_current = st.session_state.df
 if df_current is None or df_current.empty:
     st.info("Click **Build List & Run** to rank the entire US universe and scan options.")
@@ -607,11 +670,11 @@ else:
         hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
         color = "#ffffff"
         if earn and hot:
-            color = "#ffe0b2"   # both
+            color = "#ffe0b2"
         elif earn:
-            color = "#fff9c4"   # earnings in window
+            color = "#fff9c4"
         elif hot:
-            color = "#dcedc8"   # FF hot
+            color = "#dcedc8"
         return [f"background-color:{color}; color:#000000;"] * len(row)
 
     styled = (df_display.style
