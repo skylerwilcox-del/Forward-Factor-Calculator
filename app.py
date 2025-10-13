@@ -27,13 +27,15 @@ st.session_state.setdefault("trigger_run", False)
 TOP_STOCKS = 27
 ADD_ETFS = True
 FIXED_ETFS = ["SPY", "QQQ", "VOO"]
+ETF_SET = set(FIXED_ETFS)
 MAX_WORKERS = 12
 
 # Download tuning
-DL_CHUNK_STAGE1 = 40     # batch for quick latest volume
-SHORTLIST_SIZE = 800     # shortlist before 3m avg ranking (perf win)
+DL_CHUNK_STAGE1 = 50      # batch for quick latest volume
+SHORTLIST_SIZE = 1200     # shortlist before 3m avg ranking (performance + robustness)
+RANK_BATCH_3MO = 60       # batch size for 3m multi-download
 
-# Large liquid fallback universe (in case yfinance symbol fetch fails)
+# Large liquid fallback universe (in case yfinance symbol fetch fails or to top-up)
 FALLBACK_LIQUID = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","AMD","NFLX","CRM","COST","PEP","ADBE","INTC",
     "UBER","QCOM","AMAT","TSM","ORCL","PFE","MRK","JNJ","LLY","V","MA","JPM","BAC","WFC","C","GS","MS","SCHW","BLK",
@@ -210,43 +212,73 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
     return None
 
 # =========================
-# Ranking: Top 27 by 3M Avg Volume (+ ETFs)
+# Ranking: Top 27 by 3M Avg Volume (+ ETFs) — Efficient & Guaranteed Count
 # =========================
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_avg_volume_3mo(ticker: str) -> Optional[float]:
-    """Average daily volume over the last 3 months (exclude today's partial)."""
-    try:
-        df = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=False)
-        if df.empty or "Volume" not in df.columns:
-            return None
-        df = _exclude_today_if_open(df)
-        vols = df["Volume"].dropna()
-        if len(vols) == 0:
-            return None
-        return float(vols.mean())
-    except Exception:
-        return None
+def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
+    """
+    Download 3mo daily data for a batch of tickers and compute:
+      - avg_vol_3m (excluding today's partial bar)
+      - last_close (from the same dataset)
+    Returns rows only for tickers with valid volume history.
+    """
+    if not tickers:
+        return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close"])
+    raw = _safe_multi_download(tickers, period="3mo", interval="1d")
+    rows = []
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_last_close(ticker: str) -> Optional[float]:
-    try:
-        info = yf.Ticker(ticker).fast_info
-        px = info.get("last_price") or info.get("regularMarketPrice")
-        if px is not None:
-            return float(px)
-        df = yf.download(ticker, period="5d", interval="1d", progress=False)
-        if not df.empty and "Close" in df.columns:
-            return float(df["Close"].iloc[-1])
-    except Exception:
-        pass
-    return None
+    # MultiIndex frame: (ticker, field)
+    if isinstance(getattr(raw, "columns", None), pd.MultiIndex):
+        got_syms = [c[0] for c in raw.columns.unique(level=0)]
+        for t in got_syms:
+            try:
+                sub = raw[t]
+                sub = _exclude_today_if_open(sub)
+                if sub is None or sub.empty or "Volume" not in sub.columns:
+                    continue
+                vols = sub["Volume"].dropna()
+                if vols.empty:
+                    continue
+                avgv = float(vols.mean())
+                last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+                rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
+            except Exception:
+                continue
+        # Per-ticker fallback for those yfinance skipped in the batch response
+        missing = set(tickers) - set(got_syms)
+        for t in list(missing):
+            sub = _safe_single_download(t, period="3mo", interval="1d")
+            if sub is None or sub.empty or "Volume" not in sub.columns:
+                continue
+            sub = _exclude_today_if_open(sub)
+            vols = sub["Volume"].dropna()
+            if vols.empty:
+                continue
+            avgv = float(vols.mean())
+            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+            rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
+    else:
+        # Degenerate single-frame: try each individually
+        for t in tickers:
+            sub = _safe_single_download(t, period="3mo", interval="1d")
+            if sub is None or sub.empty or "Volume" not in sub.columns:
+                continue
+            sub = _exclude_today_if_open(sub)
+            vols = sub["Volume"].dropna()
+            if vols.empty:
+                continue
+            avgv = float(vols.mean())
+            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+            rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
+
+    return pd.DataFrame(rows)
 
 @st.cache_data(ttl=1200, show_spinner=False)
-def rank_top27_by_3m_avg_with_etfs(extras: List[str], shortlist_size: int = SHORTLIST_SIZE) -> pd.DataFrame:
+def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
     """
-    Efficient 2-stage ranking:
+    Efficient 2-stage ranking with guaranteed 27 stocks:
       Stage 1: quick latest volume over 7d (batched) to shortlist universe
-      Stage 2: compute true 3m avg only for shortlist, then pick Top 27 and append ETFs
+      Stage 2: iterate shortlist in 3mo batches, collect until >= TOP_STOCKS stocks
+      Then append fixed ETFs (SPY, QQQ, VOO) and de-dup (stocks first)
     """
     universe = get_us_stock_universe()
     # add manual extras
@@ -255,24 +287,18 @@ def rank_top27_by_3m_avg_with_etfs(extras: List[str], shortlist_size: int = SHOR
         if _is_clean_us_symbol(e) and e not in universe:
             universe.append(e)
 
-    # Stage 1 — latest volume to shortlist
+    # Stage 1 — latest volume → shortlist
     stage1_rows = []
-    processed = 0
-    total = len(universe)
     for block in _chunks(universe, DL_CHUNK_STAGE1):
         data = _safe_multi_download(block, period="7d", interval="1d")
 
-        # Identify which symbols we have in the multi-index result
         got = []
         if isinstance(getattr(data, "columns", None), pd.MultiIndex):
             got = [c[0] for c in data.columns.unique(level=0)]
-        elif isinstance(data, pd.DataFrame) and not data.empty:
-            # single symbol case - treat as block failure for consistency
-            got = []
 
-        # Fallback download for misses
-        missing = set(block) - set(got)
+        # Per-ticker fallback for misses
         single_store = {}
+        missing = set(block) - set(got)
         for t in list(missing):
             sub = _safe_single_download(t, period="7d", interval="1d")
             if not sub.empty:
@@ -292,12 +318,9 @@ def rank_top27_by_3m_avg_with_etfs(extras: List[str], shortlist_size: int = SHOR
                 if vol_series.empty:
                     continue
                 last_vol = float(vol_series.iloc[-1])
-                last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
-                stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
+                stage1_rows.append({"ticker": t, "last_vol": last_vol})
             except Exception:
                 continue
-
-        processed += len(block)
 
     if not stage1_rows:
         # fallback using predefined liquid list
@@ -310,57 +333,113 @@ def rank_top27_by_3m_avg_with_etfs(extras: List[str], shortlist_size: int = SHOR
             if vol_series.empty:
                 continue
             last_vol = float(vol_series.iloc[-1])
-            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
-            stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
+            stage1_rows.append({"ticker": t, "last_vol": last_vol})
 
     if not stage1_rows:
         return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close","source"])
 
-    stage1 = pd.DataFrame(stage1_rows).dropna(subset=["last_vol"]).sort_values("last_vol", ascending=False)
-    shortlist = stage1["ticker"].head(shortlist_size).tolist()
+    stage1 = (pd.DataFrame(stage1_rows)
+                .dropna(subset=["last_vol"])
+                .sort_values("last_vol", ascending=False))
+    # Build generous shortlist; exclude fixed ETFs from stock candidates up front
+    shortlist = [t for t in stage1["ticker"].tolist() if t not in ETF_SET][:SHORTLIST_SIZE]
 
-    # Stage 2 — accurate 3m average on shortlist (multithreaded)
-    results = []
-    def fetch_3m(t):
-        return {
-            "ticker": t,
-            "avg_vol_3m": get_avg_volume_3mo(t),
-            "last_close": get_last_close(t)
-        }
+    # Stage 2 — iterate shortlist in batches; stop once we have >= TOP_STOCKS valid stocks
+    collected_rows: List[Dict] = []
+    seen = set()
+    for block in _chunks(shortlist, RANK_BATCH_3MO):
+        batch_df = _batch_3mo_stats(block)
+        if not batch_df.empty:
+            batch_df = batch_df.dropna(subset=["avg_vol_3m"])
+            # drop dupes while preserving best (none expected, but safe)
+            for _, r in batch_df.iterrows():
+                t = r["ticker"]
+                if t in seen or t in ETF_SET:
+                    continue
+                seen.add(t)
+                collected_rows.append({"ticker": t, "avg_vol_3m": float(r["avg_vol_3m"]), "last_close": r["last_close"]})
+        if len(collected_rows) >= TOP_STOCKS * 2:
+            break  # enough to rank & absorb future drops
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = {ex.submit(fetch_3m, t): t for t in shortlist}
-        for fut in as_completed(futs):
-            try:
-                row = fut.result()
-                if row["avg_vol_3m"] is not None:
-                    results.append(row)
-            except Exception:
-                continue
+    vol_df = pd.DataFrame(collected_rows)
+    # If still short, top up by scanning remaining shortlist blocks and finally FALLBACK_LIQUID
+    if vol_df.empty or len(vol_df) < TOP_STOCKS:
+        remaining = [t for t in shortlist if t not in vol_df["ticker"].tolist()]
+        for block in _chunks(remaining, RANK_BATCH_3MO):
+            extra_df = _batch_3mo_stats(block)
+            if not extra_df.empty:
+                extra_df = extra_df.dropna(subset=["avg_vol_3m"])
+                for _, r in extra_df.iterrows():
+                    t = r["ticker"]
+                    if t in seen or t in ETF_SET:
+                        continue
+                    seen.add(t)
+                    vol_df = pd.concat([vol_df, pd.DataFrame([{
+                        "ticker": t, "avg_vol_3m": float(r["avg_vol_3m"]), "last_close": r["last_close"]
+                    }])], ignore_index=True)
+            if len(vol_df) >= TOP_STOCKS:
+                break
 
-    vol_df = pd.DataFrame(results)
+    if vol_df.empty or len(vol_df) < TOP_STOCKS:
+        # Last resort: top up from fallback list
+        fallback_more = [t for t in FALLBACK_LIQUID if t not in ETF_SET and t not in seen]
+        for block in _chunks(fallback_more, RANK_BATCH_3MO):
+            extra_df = _batch_3mo_stats(block)
+            if not extra_df.empty:
+                extra_df = extra_df.dropna(subset=["avg_vol_3m"])
+                for _, r in extra_df.iterrows():
+                    t = r["ticker"]
+                    if t in seen:
+                        continue
+                    seen.add(t)
+                    vol_df = pd.concat([vol_df, pd.DataFrame([{
+                        "ticker": t, "avg_vol_3m": float(r["avg_vol_3m"]), "last_close": r["last_close"]
+                    }])], ignore_index=True)
+            if len(vol_df) >= TOP_STOCKS:
+                break
+
     if vol_df.empty:
         return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close","source"])
 
-    vol_df = vol_df.dropna(subset=["avg_vol_3m"]).sort_values("avg_vol_3m", ascending=False)
+    vol_df = vol_df.sort_values("avg_vol_3m", ascending=False)
     top_stocks = vol_df.head(TOP_STOCKS).copy()
     top_stocks["source"] = "Stock"
 
     # Append ETFs (always include)
     etf_rows = []
     for etf in FIXED_ETFS:
-        vol = get_avg_volume_3mo(etf)
-        px = get_last_close(etf)
-        etf_rows.append({"ticker": etf, "avg_vol_3m": vol, "last_close": px, "source": "ETF"})
+        etf_df = _batch_3mo_stats([etf])
+        if not etf_df.empty:
+            row = etf_df.iloc[0]
+            etf_rows.append({"ticker": etf, "avg_vol_3m": float(row["avg_vol_3m"]), "last_close": row["last_close"], "source": "ETF"})
+        else:
+            # Fallback minimal row if data missing
+            etf_rows.append({"ticker": etf, "avg_vol_3m": None, "last_close": None, "source": "ETF"})
+
     full = pd.concat([top_stocks, pd.DataFrame(etf_rows)], ignore_index=True)
 
-    # De-dup but keep stocks first, ETFs after
+    # De-dup but keep stocks first, ETFs after — and guarantee final count = 27 + 3 = 30
     full["src_ord"] = (full["source"] == "ETF").astype(int)
     full = (full.sort_values(["src_ord", "avg_vol_3m"], ascending=[True, False])
                 .drop_duplicates(subset=["ticker"], keep="first")
                 .drop(columns=["src_ord"])
                 .reset_index(drop=True))
-    return full
+
+    # Ensure 27 stocks present (tops up from remaining vol_df if any ETFs collided, etc.)
+    stocks_only = full[full["source"] == "Stock"]
+    if len(stocks_only) < TOP_STOCKS:
+        needed = TOP_STOCKS - len(stocks_only)
+        remaining = vol_df[~vol_df["ticker"].isin(stocks_only["ticker"])].sort_values("avg_vol_3m", ascending=False)
+        if not remaining.empty:
+            add_rows = remaining.head(needed).copy()
+            add_rows["source"] = "Stock"
+            full = pd.concat([add_rows, full[full["source"] == "ETF"]], ignore_index=True)
+
+    # Final trim: take 27 stocks + 3 ETFs
+    stocks_final = full[full["source"] == "Stock"].sort_values("avg_vol_3m", ascending=False).head(TOP_STOCKS)
+    etfs_final = full[full["source"] == "ETF"]
+    full_final = pd.concat([stocks_final, etfs_final], ignore_index=True).reset_index(drop=True)
+    return full_final
 
 # =========================
 # IV/FF calculations
@@ -599,7 +678,7 @@ if st.session_state.trigger_run:
     extras = _normalize_tickers(raw_extra)
 
     with st.spinner("Building ranked list (3M avg volume)…"):
-        vol_top_df = rank_top27_by_3m_avg_with_etfs(extras=extras, shortlist_size=SHORTLIST_SIZE)
+        vol_top_df = rank_top27_by_3m_avg_with_etfs(extras=extras)
 
     st.session_state.vol_topN = vol_top_df
     st.session_state.tickers = vol_top_df["ticker"].tolist() if not vol_top_df.empty else []
