@@ -16,17 +16,21 @@ PACIFIC = pytz.timezone("America/Los_Angeles")
 EASTERN = pytz.timezone("America/New_York")
 st.set_page_config(page_title="Forward Vol Screener — Top 27 (All US Stocks)", layout="wide")
 
-# Persist results across reruns
-for k in ("df", "tickers", "vol_topN"):
-    if k not in st.session_state:
-        st.session_state[k] = None if k != "tickers" else []
+# Persist results across reruns (don’t overwrite if already set)
+if "df" not in st.session_state: st.session_state.df = None
+if "tickers" not in st.session_state: st.session_state.tickers = []
+if "vol_topN" not in st.session_state: st.session_state.vol_topN = None
 
 # --- Config ---
 TOP_STOCKS = 27            # number of stocks to select
 ADD_ETFS = True            # set False to omit ETFs
 FIXED_ETFS = ["VOO", "SPY", "QQQ"]
 MAX_WORKERS = 12           # options-chain parallelism
-DL_CHUNK = 200             # yfinance download chunk size for volume scan
+
+# Download tuning
+DL_CHUNK_STAGE1 = 80       # small chunks → more responsive UI for the quick pass
+DL_CHUNK_STAGE2 = 50       # shortlist chunks (heavier columns, keep small)
+SHORTLIST_SIZE = 400       # how many symbols to carry to the accurate pass
 
 # =========================
 # Helpers
@@ -130,30 +134,44 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
     return None
 
 # =========================
-# Volume: Top-27 from ALL US stocks (NASDAQ + NYSE/AMEX)
+# Volume ranking (ALL US stocks) — two-stage faster pipeline
 # =========================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_us_stock_universe() -> List[str]:
     """
-    Pull a broad U.S. stock universe from yfinance:
-    - NASDAQ listings via tickers_nasdaq()
-    - 'Other' (NYSE/AMEX and misc) via tickers_other()
+    Build a broad U.S. stock universe from yfinance helpers.
+    Falls back gracefully if any helper is missing on your yfinance version.
     """
     tickers = []
+    # NASDAQ
     try:
-        nas = yf.tickers_nasdaq()
-        if isinstance(nas, (list, tuple)) and nas:
-            tickers.extend([t.strip().upper() for t in nas if t])
+        nas = getattr(yf, "tickers_nasdaq", None)
+        if callable(nas):
+            r = nas()
+            if isinstance(r, (list, tuple)) and r:
+                tickers.extend([t.strip().upper() for t in r if t])
     except Exception:
         pass
+    # "Other" (NYSE/AMEX/misc)
     try:
-        oth = yf.tickers_other()
-        if isinstance(oth, (list, tuple)) and oth:
-            tickers.extend([t.strip().upper() for t in oth if t])
+        oth = getattr(yf, "tickers_other", None)
+        if callable(oth):
+            r = oth()
+            if isinstance(r, (list, tuple)) and r:
+                tickers.extend([t.strip().upper() for t in r if t])
     except Exception:
         pass
-
-    # De-dup and keep order
+    # If nothing returned, use S&P500 as a minimal fallback so the app still runs
+    if not tickers:
+        try:
+            spx = getattr(yf, "tickers_sp500", None)
+            if callable(spx):
+                r = spx()
+                if isinstance(r, (list, tuple)) and r:
+                    tickers.extend([t.strip().upper() for t in r if t])
+        except Exception:
+            pass
+    # Dedup, preserve order
     seen, out = set(), []
     for t in tickers:
         if t and t not in seen:
@@ -179,108 +197,132 @@ def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
         df = df[df["et_date"] < today_et]
     return df
 
-def _avg5_from_volume_series(vol: pd.Series) -> Optional[float]:
+def _avg5(vol: pd.Series) -> Optional[float]:
     vols = vol.dropna()
     last5 = vols.tail(5)
     if len(last5) < 5:
         return None
     return float(last5.mean())
 
-@st.cache_data(ttl=900, show_spinner=False)
-def rank_top_stocks_all_us(extra: List[str], top_n: int = TOP_STOCKS, add_etfs: bool = ADD_ETFS) -> pd.DataFrame:
-    """
-    1) Build ALL-US universe (NASDAQ + NYSE/AMEX via yfinance helpers).
-    2) Batch-download 20d of 1d data in chunks, exclude today's partial, average last 5 sessions' Volume.
-    3) Rank descending by that average; keep top_n stocks.
-    4) Optionally append fixed ETFs (VOO, SPY, QQQ) and user extras (deduped).
-    Returns columns: ticker, avg_week_volume, last_close, source
-    """
-    universe = get_us_stock_universe()
+def _chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
-    # Add user-provided extras into the *universe* so they can be ranked too
-    for e in extra:
+def _safe_multi_download(tickers, period, interval):
+    try:
+        return yf.download(
+            tickers=tickers,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            group_by="ticker",
+            threads=True,
+            progress=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=900, show_spinner=False)
+def rank_top_stocks_all_us(extras_tuple: tuple, top_n: int = TOP_STOCKS, add_etfs: bool = ADD_ETFS) -> pd.DataFrame:
+    """
+    Fast two-stage volume ranking across the full U.S. universe:
+      Stage 1: 7d data, use last completed session volume → shortlist (SHORTLIST_SIZE).
+      Stage 2: 20d data, compute true 5-day avg → pick top_n.
+      Append ETFs if requested.
+    extras_tuple must be a tuple for caching.
+    """
+    extras = list(extras_tuple)
+    universe = get_us_stock_universe()
+    # Include extras in the universe so they get considered in ranking
+    for e in extras:
         if e not in universe:
             universe.append(e)
 
-    # Chunk tickers for efficient multi-ticker download
-    def chunks(lst, n):
-        for i in range(0, len(lst), n):
-            yield lst[i:i+n]
-
-    rows = []
+    # ---------- Stage 1: fast shortlist by last completed session volume ----------
+    stage1_rows = []
     total = len(universe)
-    progress = st.progress(0.0, text="Scanning all U.S. stocks for 5-day average volume…")
-
+    prog1 = st.progress(0.0, text="Stage 1/2: Scanning universe (latest volumes)…")
     processed = 0
-    for block in chunks(universe, DL_CHUNK):
-        try:
-            # Multi-ticker download; group_by='ticker' → columns become MultiIndex
-            data = yf.download(
-                tickers=block,
-                period="20d",
-                interval="1d",
-                auto_adjust=False,
-                group_by="ticker",
-                threads=True,
-                progress=False,
-            )
-        except Exception:
-            data = pd.DataFrame()
 
-        # If single-ticker, yfinance returns a normal (non-MI) DataFrame; normalize to MI format
+    for block in _chunks(universe, DL_CHUNK_STAGE1):
+        data = _safe_multi_download(block, period="7d", interval="1d")
+        # Figure which tickers we actually got back
         if isinstance(data.columns, pd.MultiIndex):
-            tickers_in_block = [c[0] for c in data.columns.unique(level=0)]
+            got = [c[0] for c in data.columns.unique(level=0)]
         else:
-            # Single issue case: wrap into MI-like accessor
-            tickers_in_block = block
+            got = block
 
-        # For each ticker, compute avg over last 5 *completed* sessions
-        for t in tickers_in_block:
+        for t in got:
             try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    sub = data[t].copy()
-                else:
-                    sub = data.copy()
-
+                sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
                 if sub is None or sub.empty or "Volume" not in sub.columns:
                     continue
-
                 sub = _exclude_today_if_open(sub)
-                avgv = _avg5_from_volume_series(sub["Volume"])
-                if avgv is None:
+                if "Volume" not in sub.columns or sub["Volume"].dropna().empty:
                     continue
-
+                last_vol = float(sub["Volume"].dropna().iloc[-1])
                 last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
-                rows.append({"ticker": t, "avg_week_volume": avgv, "last_close": last_close, "source": "US"})
+                stage1_rows.append({"ticker": t, "last_vol": last_vol, "last_close": last_close})
             except Exception:
-                # Skip problematic symbols silently
                 continue
 
         processed += len(block)
-        progress.progress(min(processed/total, 1.0))
-    progress.empty()
+        prog1.progress(min(processed/total, 1.0))
+    prog1.empty()
 
-    vol_df = pd.DataFrame(rows)
+    if not stage1_rows:
+        return pd.DataFrame(columns=["ticker","avg_week_volume","last_close","source"])
+
+    stage1 = pd.DataFrame(stage1_rows).dropna(subset=["last_vol"]).sort_values("last_vol", ascending=False)
+    shortlist = stage1["ticker"].head(SHORTLIST_SIZE).tolist()
+
+    # ---------- Stage 2: accurate 5-day average on shortlist ----------
+    stage2_rows = []
+    prog2 = st.progress(0.0, text="Stage 2/2: Computing 5-day average volume on shortlist…")
+    processed = 0
+    for block in _chunks(shortlist, DL_CHUNK_STAGE2):
+        data = _safe_multi_download(block, period="20d", interval="1d")
+        if isinstance(data.columns, pd.MultiIndex):
+            got = [c[0] for c in data.columns.unique(level=0)]
+        else:
+            got = block
+
+        for t in got:
+            try:
+                sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+                if sub is None or sub.empty or "Volume" not in sub.columns:
+                    continue
+                sub = _exclude_today_if_open(sub)
+                if "Volume" not in sub.columns:
+                    continue
+                avgv = _avg5(sub["Volume"])
+                if avgv is None:
+                    continue
+                last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+                stage2_rows.append({"ticker": t, "avg_week_volume": avgv, "last_close": last_close, "source": "Stock"})
+            except Exception:
+                continue
+
+        processed += len(block)
+        prog2.progress(min(processed/len(shortlist), 1.0))
+    prog2.empty()
+
+    vol_df = pd.DataFrame(stage2_rows)
     if vol_df.empty:
         return pd.DataFrame(columns=["ticker","avg_week_volume","last_close","source"])
 
-    # Keep only stocks for the Top-N ranking. ETFs often end with known ETF names,
-    # but robust detection is nontrivial; we'll rank everything, then *append* fixed ETFs explicitly.
-    vol_df = vol_df.dropna(subset=["avg_week_volume"])
-    vol_df = vol_df.sort_values("avg_week_volume", ascending=False)
-
+    vol_df = vol_df.dropna(subset=["avg_week_volume"]).sort_values("avg_week_volume", ascending=False)
     top_stocks = vol_df.head(top_n).copy()
-    top_stocks["source"] = "Stock"
 
     # Append ETFs explicitly (no ranking impact)
     if add_etfs:
         etf_rows = []
         for etf in FIXED_ETFS:
             try:
-                etf_hist = yf.download(etf, period="20d", interval="1d", auto_adjust=False, progress=False)
-                etf_hist = _exclude_today_if_open(etf_hist)
-                avgv = _avg5_from_volume_series(etf_hist["Volume"]) if "Volume" in etf_hist.columns else None
-                last_close = float(etf_hist["Close"].dropna().iloc[-1]) if "Close" in etf_hist.columns and not etf_hist["Close"].dropna().empty else None
+                hist = yf.download(etf, period="20d", interval="1d", auto_adjust=False, progress=False)
+                hist = _exclude_today_if_open(hist)
+                avgv = _avg5(hist["Volume"]) if "Volume" in hist.columns else None
+                last_close = float(hist["Close"].dropna().iloc[-1]) if "Close" in hist.columns and not hist["Close"].dropna().empty else None
             except Exception:
                 avgv, last_close = None, None
             etf_rows.append({"ticker": etf, "avg_week_volume": avgv, "last_close": last_close, "source": "ETF"})
@@ -289,7 +331,6 @@ def rank_top_stocks_all_us(extra: List[str], top_n: int = TOP_STOCKS, add_etfs: 
     else:
         top_full = top_stocks
 
-    # De-dup safety (prefer first occurrence)
     top_full = top_full.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
     return top_full
 
@@ -511,20 +552,21 @@ DISPLAY_KEYS = ["ticker","pair","exp1","dte1","iv1","exp2","dte2","iv2","fwd_vol
 st.title("📈 Forward Volatility Screener (Top 27 by 5-Day Avg Volume — All US Stocks)")
 
 st.markdown(
-    "This scans **all U.S. stocks (NASDAQ + NYSE/AMEX)**, ranks by **average volume over the last 5 completed sessions**, "
+    "This scans **all U.S. stocks (NASDAQ + NYSE/AMEX)** in two stages, ranks by **average volume over the last 5 completed sessions**, "
     f"selects the **Top {TOP_STOCKS} stocks**, and {'adds **VOO, SPY, QQQ**' if ADD_ETFS else 'does not add ETFs'}."
 )
 
 raw_extra = st.text_input("Optional: Add tickers (comma/space separated)", "", placeholder="e.g., NVDA, TSLA, META")
 
+# --- The button now always triggers immediate visual feedback via Stage 1 progress bar ---
 colA, colB = st.columns([1, 3])
 with colA:
-    run = st.button("Build List & Run", type="primary")
+    run = st.button("Build List & Run", type="primary", help="Two-stage fast scan across the US universe")
 with colB:
-    st.caption("Universe for ranking = NASDAQ + NYSE/AMEX via yfinance. Excludes today's partial volume until after the close (ET).")
+    st.caption("Excludes today's partial volume until after the 4:05pm ET close.")
 
 if run:
-    extras = _normalize_tickers(raw_extra)
+    extras = tuple(_normalize_tickers(raw_extra))  # tuple → cache-friendly
     vol_top_df = rank_top_stocks_all_us(extras, top_n=TOP_STOCKS, add_etfs=ADD_ETFS)
     st.session_state.vol_topN = vol_top_df
     tickers = vol_top_df["ticker"].tolist()
@@ -535,9 +577,8 @@ if run:
 if st.session_state.vol_topN is not None and not st.session_state.vol_topN.empty:
     st.subheader(f"Selected Tickers (Top {TOP_STOCKS} Stocks by 5-Day Avg Vol{' + ETFs' if ADD_ETFS else ''})")
     base = st.session_state.vol_topN.copy()
-
-    # Stable ordering: Stocks first, then ETFs, then Extras (if any were included earlier as 'extra')
-    source_order = pd.api.types.CategoricalDtype(categories=["Stock", "ETF", "US", "Extra"], ordered=True)
+    # Order: Stocks first, then ETFs
+    source_order = pd.api.types.CategoricalDtype(categories=["Stock", "ETF"], ordered=True)
     base["Source"] = base["source"].astype(source_order)
     base["SourceOrder"] = base["Source"].cat.codes
     base["AvgVolNum"] = pd.to_numeric(base["avg_week_volume"], errors="coerce")
@@ -608,6 +649,6 @@ else:
     st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
 
     st.markdown(
-        "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
+        "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b></p>",
         unsafe_allow_html=True,
     )
