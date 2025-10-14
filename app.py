@@ -414,11 +414,23 @@ def screen_ticker(ticker: str) -> List[Dict]:
                  "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"]}]
     ed = [(e, _calc_dte(e)) for e in expiries]
     nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
+
+    # Existing anchors
     e30, e60, e90 = nearest(30), nearest(60), nearest(90)
+
+    # NEW: short-term anchors for 7–14 and 7–30
+    e7, e14 = nearest(7), nearest(14)
+
     pairs = []
+    # NEW pairs first (ensure increasing DTE order)
+    if e7 and e14 and e14[1] > e7[1]:   pairs.append(("7–14", e7, e14))
+    if e7 and e30 and e30[1] > e7[1]:   pairs.append(("7–30", e7, e30))
+
+    # Existing pairs
     if e30 and e60 and e60[1] > e30[1]: pairs.append(("30–60", e30, e60))
     if e30 and e90 and e90[1] > e30[1]: pairs.append(("30–90", e30, e90))
     if e60 and e90 and e90[1] > e60[1]: pairs.append(("60–90", e60, e90))
+
     earn_dt = get_next_earnings_date(ticker)
     rows = []
     for label, (exp1, dte1), (exp2, dte2) in pairs:
