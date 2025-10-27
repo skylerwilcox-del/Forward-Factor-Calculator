@@ -820,15 +820,44 @@ else:
 
     sort_key = LABEL_TO_KEY.get(sort_label, "ff")
     df_sorted = sort_df(df_current, sort_key, sort_ascending)
+
+    # === NEW: push earn_invalid rows (earnings ≤ Exp1) to the bottom, stably ===
+    earn_invalid_flag = df_sorted["_tags"].apply(
+        lambda t: int(isinstance(t, (list, tuple, set)) and ("earn_invalid" in t))
+    )
+    df_sorted = (df_sorted
+                 .assign(__earn_invalid=earn_invalid_flag.values)
+                 .sort_values(by=["__earn_invalid"], ascending=[True], kind="mergesort")
+                 .drop(columns=["__earn_invalid"])
+                 .reset_index(drop=True))
+
     have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
 
     # Helper flag to style INVALID earnings dates
     invalid_mask = df_sorted["_tags"].apply(lambda t: isinstance(t, (list, tuple, set)) and ("earn_invalid" in t))
+    hot_mask = df_sorted["_tags"].apply(lambda t: isinstance(t, (list, tuple, set)) and ("hot" in t))
+
     df_display = df_sorted[have_keys].copy()
     df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
-    df_display["_invalid_earn"] = invalid_mask.values  # hidden helper
+    # hidden helpers for styling
+    df_display["_invalid_earn"] = invalid_mask.values
+    df_display["_hot"] = hot_mask.values
 
-    # Styling: yellow only on the Earnings Date cell when invalid; green rows for "hot"
+    # === NEW: base row styling to avoid dark/black rows on dark theme ===
+    def _style_base_rows(row: pd.Series):
+        # light gray base for readability everywhere
+        return ["background-color:#f7f7f7; color:#000;"] * len(row)
+
+    # Keep green highlight for "hot" rows, overriding base where applied
+    def _style_hot_rows(row: pd.Series):
+        i = row.name
+        hot = bool(df_display["_hot"].iloc[i])
+        base = "background-color:#dcedc8; color:#000;" if hot else ""
+        # if not hot, return empty strings so base style remains
+        style = base if hot else ""
+        return [style] * len(row)
+
+    # Yellow only on the Earnings Date cell when invalid
     def _style_earnings_col(col: pd.Series):
         flags = df_display["_invalid_earn"]
         styles = []
@@ -836,31 +865,15 @@ else:
             styles.append("background-color:#fff59d; color:#000;" if bool(flags.loc[idx]) else "")
         return styles
 
-    def _style_hot_rows(row: pd.Series):
-        i = row.name
-        tags = df_sorted["_tags"].iloc[i] if i in df_sorted.index else []
-        hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
-        base = "background-color:#dcedc8; color:#000;" if hot else ""
-        return [base] * len(row)
-
-    styled = (df_display.drop(columns=["_invalid_earn"]).style
+    styled = (df_display.drop(columns=["_invalid_earn","_hot"]).style
+              # 1) apply base for all rows (prevents black rows)
+              .apply(_style_base_rows, axis=1)
+              # 2) overlay hot rows
               .apply(_style_hot_rows, axis=1)
+              # 3) overlay invalid earnings only on the specific column
               .apply(_style_earnings_col, subset=["Earnings Date"])
               .set_properties(**{"border":"1px solid #bbb","color":"#000","font-size":"14px"}))
 
-    st.markdown("""
-        <style>
-        table {border-collapse: collapse; width: 100%;}
-        th {position: sticky; top: 0; background-color: #f0f0f0; color: #000; font-weight: bold;}
-        tr:nth-child(even) {background-color: #fafafa;}
-        tr:hover {background-color: #e0e0e0;}
-        </style>
-    """, unsafe_allow_html=True)
-
+    # Remove the old zebra/hover CSS that conflicted with dark theme
     st.markdown(styled.to_html(), unsafe_allow_html=True)
-    st.caption("Legend:  ≤Exp1 = before short leg (marked INVALID);  Exp1–Exp2 = between legs;  >Exp2 = after long leg.  🟩 FF ≥ 0.20  🟨 Earnings ≤Exp1")
-
-st.markdown(
-    "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
-    unsafe_allow_html=True,
-)
+    st.caption("Legend:  ≤Exp1 = before short leg (marked INVALID, sorted last);  Exp1–Exp2 = between legs;  >Exp2 = after long leg.  🟩 FF ≥ 0.20  🟨 Earnings ≤Exp1")
