@@ -580,20 +580,24 @@ def _nearest(ed, target):
 
 @_cache_wrapper(900)
 def screen_ticker(ticker: str) -> List[Dict]:
+    """
+    Returns 0+ rows for valid option pairs. If we can't get spot or expiries,
+    we return [] so no blank placeholder rows ever appear.
+    """
     spot = get_spot(ticker)
     if spot is None:
-        return [{"ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
-                 "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-                 "cal_debit": "—","earn_in_window": "—","_tags": ["no_spot"]}]
+        return []  # <-- no placeholders
+
     expiries = get_options(ticker)
     if not expiries:
-        return [{"ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
-                 "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-                 "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"]}]
+        return []  # <-- no placeholders
+
     ed = [(e, _calc_dte(e)) for e in expiries]
 
     # Anchors
-    e7, e14, e30, e60, e90 = _nearest(ed, 7), _nearest(ed, 14), _nearest(ed, 30), _nearest(ed, 60), _nearest(ed, 90)
+    e7, e14, e30, e60, e90 = (
+        _nearest(ed, 7), _nearest(ed, 14), _nearest(ed, 30), _nearest(ed, 60), _nearest(ed, 90)
+    )
 
     pairs = []
     def add_pair(name, a, b):
@@ -606,13 +610,19 @@ def screen_ticker(ticker: str) -> List[Dict]:
     add_pair("60–90", e60, e90)
 
     next_earn_date = get_next_earnings_date_only(ticker)
-
     rows = []
+
     for label, (exp1, dte1), (exp2, dte2) in pairs:
         iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
-
         earn_display, invalid = earnings_label_for_pair_date_only(exp1, exp2, next_earn_date)
-        tags = ["earn_invalid"] if invalid else []
+
+        # If both IVs are missing AND there is no earnings date info, skip this pair
+        if iv1 is None and iv2 is None and (earn_display == "—"):
+            continue
+
+        tags = []
+        if invalid:
+            tags.append("earn_invalid")
 
         if iv1 is None or iv2 is None:
             rows.append({
@@ -641,7 +651,9 @@ def screen_ticker(ticker: str) -> List[Dict]:
             "cal_debit": f"{debit:.2f}" if debit is not None else "—",
             "earn_in_window": earn_display, "_tags": tags
         })
+
     return rows
+
 
 def scan_many(tickers: List[str]) -> pd.DataFrame:
     rows: List[Dict] = []
@@ -789,91 +801,103 @@ df_current = st.session_state.df
 if df_current is None or df_current.empty:
     st.info("Click **Build List & Run** to rank the entire US universe and scan options.")
 else:
-    DISPLAY_MAP = {
-        "ticker": "Ticker",
-        "pair": "Pair",
-        "exp1": "Exp 1",
-        "dte1": "Dte 1",
-        "iv1": "IV 1",
-        "exp2": "Exp 2",
-        "dte2": "Dte 2",
-        "iv2": "IV 2",
-        "fwd_vol": "Forward Vol",
-        "ff": "FF",
-        "cal_debit": "Call Debit",
-        "earn_in_window": "Earnings Date",
-    }
-    LABEL_TO_KEY = {v: k for k, v in DISPLAY_MAP.items()}
-    DISPLAY_KEYS = ["ticker","pair","exp1","dte1","iv1","exp2","dte2","iv2","fwd_vol","ff","cal_debit","earn_in_window"]
+    # Drop any fully blank rows defensively (should be rare now)
+    def _is_all_blank(r):
+        return (
+            str(r.get("pair","—")) == "—" and
+            str(r.get("exp1","—")) == "—" and
+            str(r.get("exp2","—")) == "—" and
+            str(r.get("iv1","—"))  == "—" and
+            str(r.get("iv2","—"))  == "—" and
+            str(r.get("earn_in_window","—")) == "—"
+        )
+    df_current = df_current[~df_current.apply(_is_all_blank, axis=1)]
+    if df_current.empty:
+        st.warning("No option pairs available to display yet. Try **Force refresh** and rerun.")
+    else:
+        DISPLAY_MAP = {
+            "ticker": "Ticker",
+            "pair": "Pair",
+            "exp1": "Exp 1",
+            "dte1": "Dte 1",
+            "iv1": "IV 1",
+            "exp2": "Exp 2",
+            "dte2": "Dte 2",
+            "iv2": "IV 2",
+            "fwd_vol": "Forward Vol",
+            "ff": "FF",
+            "cal_debit": "Call Debit",
+            "earn_in_window": "Earnings Date",
+        }
+        LABEL_TO_KEY = {v: k for k, v in DISPLAY_MAP.items()}
+        DISPLAY_KEYS = ["ticker","pair","exp1","dte1","iv1","exp2","dte2","iv2","fwd_vol","ff","cal_debit","earn_in_window"]
 
-    display_labels = [DISPLAY_MAP[k] for k in DISPLAY_KEYS if k in df_current.columns]
-    default_label = DISPLAY_MAP.get("ff", display_labels[0])
+        display_labels = [DISPLAY_MAP[k] for k in DISPLAY_KEYS if k in df_current.columns]
+        default_label = DISPLAY_MAP.get("ff", display_labels[0])
 
-    c1, c2, c3 = st.columns([3, 1.2, 1.8], vertical_alignment="bottom")
-    with c1:
-        sort_label = st.selectbox("Sort by", options=display_labels,
-                                  index=display_labels.index(default_label), key="sort_col_label")
-    with c2:
-        sort_ascending = st.toggle("Ascending", value=False, key="sort_asc")
-    with c3:
-        st.caption("Blanks always shown last")
+        c1, c2, c3 = st.columns([3, 1.2, 1.8], vertical_alignment="bottom")
+        with c1:
+            sort_label = st.selectbox("Sort by", options=display_labels,
+                                      index=display_labels.index(default_label), key="sort_col_label")
+        with c2:
+            sort_ascending = st.toggle("Ascending", value=False, key="sort_asc")
+        with c3:
+            st.caption("Invalid earnings are sorted to the bottom. Blanks always shown last.")
 
-    sort_key = LABEL_TO_KEY.get(sort_label, "ff")
-    df_sorted = sort_df(df_current, sort_key, sort_ascending)
+        sort_key = LABEL_TO_KEY.get(sort_label, "ff")
+        df_sorted = sort_df(df_current, sort_key, sort_ascending)
 
-    # === NEW: push earn_invalid rows (earnings ≤ Exp1) to the bottom, stably ===
-    earn_invalid_flag = df_sorted["_tags"].apply(
-        lambda t: int(isinstance(t, (list, tuple, set)) and ("earn_invalid" in t))
-    )
-    df_sorted = (df_sorted
-                 .assign(__earn_invalid=earn_invalid_flag.values)
-                 .sort_values(by=["__earn_invalid"], ascending=[True], kind="mergesort")
-                 .drop(columns=["__earn_invalid"])
-                 .reset_index(drop=True))
+        # Push earn_invalid rows to the bottom (stable)
+        earn_invalid_flag = df_sorted["_tags"].apply(
+            lambda t: int(isinstance(t, (list, tuple, set)) and ("earn_invalid" in t))
+        )
+        df_sorted = (df_sorted
+                     .assign(__earn_invalid=earn_invalid_flag.values)
+                     .sort_values(by=["__earn_invalid"], ascending=[True], kind="mergesort")
+                     .drop(columns=["__earn_invalid"])
+                     .reset_index(drop=True))
 
-    have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
+        have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
 
-    # Helper flag to style INVALID earnings dates
-    invalid_mask = df_sorted["_tags"].apply(lambda t: isinstance(t, (list, tuple, set)) and ("earn_invalid" in t))
-    hot_mask = df_sorted["_tags"].apply(lambda t: isinstance(t, (list, tuple, set)) and ("hot" in t))
+        invalid_mask = df_sorted["_tags"].apply(lambda t: isinstance(t, (list, tuple, set)) and ("earn_invalid" in t))
+        hot_mask     = df_sorted["_tags"].apply(lambda t: isinstance(t, (list, tuple, set)) and ("hot" in t))
 
-    df_display = df_sorted[have_keys].copy()
-    df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
-    # hidden helpers for styling
-    df_display["_invalid_earn"] = invalid_mask.values
-    df_display["_hot"] = hot_mask.values
+        df_display = df_sorted[have_keys].copy()
+        df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
+        df_display["_invalid_earn"] = invalid_mask.values
+        df_display["_hot"] = hot_mask.values
 
-    # === NEW: base row styling to avoid dark/black rows on dark theme ===
-    def _style_base_rows(row: pd.Series):
-        # light gray base for readability everywhere
-        return ["background-color:#f7f7f7; color:#000;"] * len(row)
+        # Base cell style to prevent any dark/black rows (override with !important)
+        BASE = "background-color:#f7f7f7 !important; color:#000 !important;"
 
-    # Keep green highlight for "hot" rows, overriding base where applied
-    def _style_hot_rows(row: pd.Series):
-        i = row.name
-        hot = bool(df_display["_hot"].iloc[i])
-        base = "background-color:#dcedc8; color:#000;" if hot else ""
-        # if not hot, return empty strings so base style remains
-        style = base if hot else ""
-        return [style] * len(row)
+        def _style_base_rows(_row: pd.Series):
+            return [BASE] * len(_row)
 
-    # Yellow only on the Earnings Date cell when invalid
-    def _style_earnings_col(col: pd.Series):
-        flags = df_display["_invalid_earn"]
-        styles = []
-        for idx, _ in col.items():
-            styles.append("background-color:#fff59d; color:#000;" if bool(flags.loc[idx]) else "")
-        return styles
+        def _style_hot_rows(row: pd.Series):
+            i = row.name
+            hot = bool(df_display["_hot"].iloc[i])
+            return (["background-color:#dcedc8 !important; color:#000 !important;"] * len(row)) if hot else [""] * len(row)
 
-    styled = (df_display.drop(columns=["_invalid_earn","_hot"]).style
-              # 1) apply base for all rows (prevents black rows)
-              .apply(_style_base_rows, axis=1)
-              # 2) overlay hot rows
-              .apply(_style_hot_rows, axis=1)
-              # 3) overlay invalid earnings only on the specific column
-              .apply(_style_earnings_col, subset=["Earnings Date"])
-              .set_properties(**{"border":"1px solid #bbb","color":"#000","font-size":"14px"}))
+        def _style_earnings_col(col: pd.Series):
+            flags = df_display["_invalid_earn"]
+            styles = []
+            for idx, _ in col.items():
+                styles.append("background-color:#fff59d !important; color:#000 !important;" if bool(flags.loc[idx]) else "")
+            return styles
 
-    # Remove the old zebra/hover CSS that conflicted with dark theme
-    st.markdown(styled.to_html(), unsafe_allow_html=True)
-    st.caption("Legend:  ≤Exp1 = before short leg (marked INVALID, sorted last);  Exp1–Exp2 = between legs;  >Exp2 = after long leg.  🟩 FF ≥ 0.20  🟨 Earnings ≤Exp1")
+        styled = (df_display.drop(columns=["_invalid_earn","_hot"]).style
+                  .apply(_style_base_rows, axis=1)
+                  .apply(_style_hot_rows, axis=1)
+                  .apply(_style_earnings_col, subset=["Earnings Date"])
+                  .set_properties(**{"border":"1px solid #bbb","color":"#000","font-size":"14px"}))
+
+        # Harden headers too (avoid theme bleed-through)
+        st.markdown("""
+            <style>
+              .dataframe thead th { background-color:#eeeeee !important; color:#000 !important; font-weight:700 !important; }
+              .dataframe td { background-clip: padding-box !important; }
+            </style>
+        """, unsafe_allow_html=True)
+
+        st.markdown(styled.to_html(), unsafe_allow_html=True)
+        st.caption("Legend:  ≤Exp1 = before short leg (INVALID, sorted last);  Exp1–Exp2 = between legs;  >Exp2 = after long leg.  🟩 FF ≥ 0.20  🟨 Earnings ≤Exp1")
