@@ -104,10 +104,7 @@ def _chunks(lst, n):
 # yfinance (cached)
 # =========================
 def _cache_wrapper(ttl):
-    # allows easy cache busting via a checkbox
-    def decorator(func):
-        return st.cache_data(ttl=ttl, show_spinner=False)(func)
-    return decorator
+    return st.cache_data(ttl=ttl, show_spinner=False)
 
 @_cache_wrapper(1800)
 def get_us_stock_universe() -> List[str]:
@@ -209,7 +206,6 @@ def _as_et(dt: pd.Timestamp | datetime | str | date) -> Optional[datetime]:
             return ts.tz_convert("America/New_York").to_pydatetime()
         if isinstance(dt, pd.Timestamp):
             if dt.tzinfo is None:
-                # yfinance often returns UTC-naive midnight for date-only → treat as date-only
                 if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
                     return None
                 dt = dt.tz_localize(UTC)
@@ -218,7 +214,6 @@ def _as_et(dt: pd.Timestamp | datetime | str | date) -> Optional[datetime]:
             return dt.tz_convert(EASTERN).to_pydatetime()
         if isinstance(dt, datetime):
             if dt.tzinfo is None:
-                # naive midnight? treat as date-only
                 if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
                     return None
                 dt = dt.replace(tzinfo=UTC)
@@ -234,11 +229,42 @@ def _expand_proxies_for_date(d: date) -> List[datetime]:
         datetime.combine(d, time(16,1)).replace(tzinfo=EASTERN),   # AMC
     ]
 
+def _extract_dates_from_get_earnings_dates(df: pd.DataFrame) -> List[datetime]:
+    """
+    yfinance may return:
+    - DatetimeIndex named 'Earnings Date'
+    - or a column 'Earnings Date'
+    Normalize both to ET datetimes (with None meaning date-only → handled by caller).
+    """
+    out: List[datetime] = []
+    if df is None or df.empty:
+        return out
+
+    # 1) Index path (most common)
+    if isinstance(df.index, (pd.DatetimeIndex, pd.Index)) and str(getattr(df.index, "name", "")).lower().startswith("earnings"):
+        for val in df.index.tolist():
+            # Keep raw; caller will run _as_et (which returns None for date-only midnight)
+            out.append(val)
+
+    # 2) Column path (older variants / some forks)
+    if "Earnings Date" in df.columns:
+        out.extend(df["Earnings Date"].tolist())
+
+    # Dedup while preserving order
+    seen = set()
+    uniq = []
+    for v in out:
+        key = str(v)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(v)
+    return uniq
+
 @_cache_wrapper(900)
 def get_next_earnings_event_et(ticker: str) -> Optional[datetime]:
     """
     Returns the earliest earnings datetime in ET that is >= (today ET - 1 day).
-    Gathers from get_earnings_dates, calendar, and info/fast_info; robust to date-only.
+    Gathers from get_earnings_dates (index or column), calendar, and info/fast_info; robust to date-only.
     """
     tk = yf.Ticker(ticker)
     now_et = datetime.now(EASTERN)
@@ -246,23 +272,22 @@ def get_next_earnings_event_et(ticker: str) -> Optional[datetime]:
 
     candidates: List[datetime] = []
 
-    # 1) get_earnings_dates
+    # 1) get_earnings_dates (index or column)
     try:
         df = tk.get_earnings_dates(limit=24)
-        if df is not None and not df.empty:
-            col = "Earnings Date" if "Earnings Date" in df.columns else df.columns[0]
-            for val in df[col].tolist():
-                dt_et = _as_et(val)
-                if dt_et is not None:
-                    candidates.append(dt_et.replace(microsecond=0))
-                else:
-                    # date-only → add BMO/AMC proxies
-                    d = (val.date() if isinstance(val, (pd.Timestamp, datetime)) else
-                         val if isinstance(val, date) else
-                         pd.to_datetime(val, errors="coerce").date())
-                    if isinstance(d, date):
-                        for p in _expand_proxies_for_date(d):
-                            candidates.append(p.replace(microsecond=0))
+        vals = _extract_dates_from_get_earnings_dates(df) if df is not None else []
+        for val in vals:
+            dt_et = _as_et(val)
+            if dt_et is not None:
+                candidates.append(dt_et.replace(microsecond=0))
+            else:
+                # date-only → add BMO/AMC proxies
+                d = (val.date() if isinstance(val, (pd.Timestamp, datetime)) else
+                     val if isinstance(val, date) else
+                     pd.to_datetime(val, errors="coerce").date())
+                if isinstance(d, date):
+                    for p in _expand_proxies_for_date(d):
+                        candidates.append(p.replace(microsecond=0))
     except Exception:
         pass
 
@@ -270,10 +295,15 @@ def get_next_earnings_event_et(ticker: str) -> Optional[datetime]:
     try:
         cal = tk.calendar
         candidate = None
-        if hasattr(cal, "index") and "Earnings Date" in getattr(cal, "index", []):
-            candidate = cal.loc["Earnings Date"].values[0]
-        elif isinstance(cal, dict) and "Earnings Date" in cal:
-            candidate = cal.get("Earnings Date")
+        # Some yfinance builds put the date in index, others as dict-like
+        if hasattr(cal, "index"):
+            # Try index value by common keys
+            for key in ["Earnings Date","EarningsDate","Earnings"]:
+                if key in list(cal.index):
+                    candidate = cal.loc[key].values[0]
+                    break
+        if candidate is None and isinstance(cal, dict):
+            candidate = cal.get("Earnings Date") or cal.get("EarningsDate")
         if candidate is not None:
             dt_et = _as_et(candidate)
             if dt_et is not None:
@@ -315,7 +345,6 @@ def get_next_earnings_event_et(ticker: str) -> Optional[datetime]:
     if not candidates:
         return None
 
-    # pick earliest >= floor
     fut = [c for c in candidates if c >= floor]
     if not fut:
         return None
@@ -666,7 +695,6 @@ st.markdown(
 
 refresh = st.checkbox("Force refresh data (bust caches)", value=False, help="Use if earnings dates look stale.")
 if refresh:
-    # Clear all cache entries for this app
     st.cache_data.clear()
 
 raw_extra = st.text_input("Optional: Add tickers (comma/space separated)", "", placeholder="e.g., NVDA, TSLA, OPEN, META")
