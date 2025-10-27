@@ -190,7 +190,7 @@ def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return oc.calls.copy(), oc.puts.copy()
 
 # =========================
-# Earnings — robust next-event fetch (ALWAYS returns a date if available)
+# Earnings — make sure we ALWAYS fill the column when any date exists
 # =========================
 def _extract_dates_from_get_earnings_dates(df: pd.DataFrame) -> List[date]:
     """Normalize any structure returned by yfinance.get_earnings_dates into plain Python dates."""
@@ -198,27 +198,29 @@ def _extract_dates_from_get_earnings_dates(df: pd.DataFrame) -> List[date]:
     if df is None or df.empty:
         return out
 
-    # Index-style
-    if isinstance(df.index, (pd.DatetimeIndex, pd.Index)) and str(getattr(df.index, "name", "")).lower().startswith("earnings"):
-        for val in df.index.tolist():
-            try:
-                dt = pd.to_datetime(val, errors="coerce").date()
-                if isinstance(dt, date):
-                    out.append(dt)
-            except Exception:
-                continue
+    # Index-style (most common in yfinance)
+    if isinstance(df.index, (pd.DatetimeIndex, pd.Index)):
+        idx_name = str(getattr(df.index, "name", "") or "").lower()
+        if "earnings" in idx_name:
+            for val in df.index.tolist():
+                try:
+                    d = pd.to_datetime(val, errors="coerce").date()
+                    if isinstance(d, date):
+                        out.append(d)
+                except Exception:
+                    pass
 
-    # Column-style
+    # Column-style (some builds)
     if "Earnings Date" in df.columns:
         for val in df["Earnings Date"].tolist():
             try:
-                dt = pd.to_datetime(val, errors="coerce").date()
-                if isinstance(dt, date):
-                    out.append(dt)
+                d = pd.to_datetime(val, errors="coerce").date()
+                if isinstance(d, date):
+                    out.append(d)
             except Exception:
-                continue
+                pass
 
-    # Deduplicate preserving order
+    # Dedup preserving order
     seen, uniq = set(), []
     for d in out:
         if d not in seen:
@@ -226,7 +228,8 @@ def _extract_dates_from_get_earnings_dates(df: pd.DataFrame) -> List[date]:
             uniq.append(d)
     return uniq
 
-@_cache_wrapper(900)
+# Cache with a very short TTL so refreshes propagate quickly
+@st.cache_data(ttl=300, show_spinner=False)
 def get_next_earnings_date_only(ticker: str) -> Optional[date]:
     """
     Returns the earliest *calendar date* (ET) of the next earnings event, if known.
@@ -250,20 +253,21 @@ def get_next_earnings_date_only(ticker: str) -> Optional[date]:
         cal = tk.calendar
         raw = None
         if hasattr(cal, "index"):
-            for k in ["Earnings Date","EarningsDate","Earnings"]:
-                if k in list(cal.index):
-                    vals = cal.loc[k].values
-                    raw = vals[0] if len(vals) else None
-                    break
+            # Sometimes values are across columns; take the first non-null
+            if "Earnings Date" in list(cal.index) or "EarningsDate" in list(cal.index):
+                key = "Earnings Date" if "Earnings Date" in list(cal.index) else "EarningsDate"
+                row = cal.loc[key]
+                # row may be Series with Timestamp/str
+                for v in list(row.values):
+                    if pd.notna(v):
+                        raw = v
+                        break
         if raw is None and isinstance(cal, dict):
-            raw = cal.get("Earnings Date") or cal.get("EarningsDate") or cal.get("Earnings")
+            raw = cal.get("Earnings Date") or cal.get("EarningsDate")
         if raw is not None:
-            try:
-                d = pd.to_datetime(raw, errors="coerce").date()
-                if isinstance(d, date):
-                    candidates.append(d)
-            except Exception:
-                pass
+            d = pd.to_datetime(raw, errors="coerce").date()
+            if isinstance(d, date):
+                candidates.append(d)
     except Exception:
         pass
 
@@ -511,14 +515,25 @@ def screen_ticker(ticker: str) -> List[Dict]:
     add_pair("30–90", e30, e90)
     add_pair("60–90", e60, e90)
 
-    # Next earnings DATE (date-only; always displayed if available)
+    # Fetch next earnings DATE once per ticker (ALWAYS display if found)
     next_earn_date = get_next_earnings_date_only(ticker)
 
     rows = []
     for label, (exp1, dte1), (exp2, dte2) in pairs:
         iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
         if iv1 is None or iv2 is None:
+            # Even if IVs missing, still show earnings info for visibility
+            earn_display, invalid = earnings_label_for_pair_date_only(exp1, exp2, next_earn_date)
+            rows.append({
+                "ticker": ticker, "pair": label,
+                "exp1": exp1, "dte1": dte1, "iv1": "—",
+                "exp2": exp2, "dte2": dte2, "iv2": "—",
+                "fwd_vol": "—", "ff": "—", "cal_debit": "—",
+                "earn_in_window": earn_display,
+                "_tags": ["earn_invalid"] if invalid else []
+            })
             continue
+
         s1, s2 = iv1/100.0, iv2/100.0
         T1, T2 = dte1/365.0, dte2/365.0
         fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
@@ -723,16 +738,14 @@ else:
     df_sorted = sort_df(df_current, sort_key, sort_ascending)
     have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
 
-    # Derive a helper column to style INVALID earnings dates
+    # Helper flag to style INVALID earnings dates
     invalid_mask = df_sorted["_tags"].apply(lambda t: isinstance(t, (list, tuple, set)) and ("earn_invalid" in t))
     df_display = df_sorted[have_keys].copy()
     df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
-    df_display["_invalid_earn"] = invalid_mask.values  # not shown, just for styling lookup
+    df_display["_invalid_earn"] = invalid_mask.values  # hidden helper
 
-    # Styling: only color the "Earnings Date" cell yellow when invalid; keep FF hot rows greenish
+    # Styling: yellow only on the Earnings Date cell when invalid; green rows for "hot"
     def _style_earnings_col(col: pd.Series):
-        # col is the visible "Earnings Date" column
-        # We need access to the hidden invalid flags aligned by index
         flags = df_display["_invalid_earn"]
         styles = []
         for idx, _ in col.items():
@@ -740,8 +753,6 @@ else:
         return styles
 
     def _style_hot_rows(row: pd.Series):
-        # Soft green when FF >= 0.20 (but don't override the earnings cell style)
-        # We'll set background for all cells lightly; the yellow cell stays yellow via precedence
         i = row.name
         tags = df_sorted["_tags"].iloc[i] if i in df_sorted.index else []
         hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
