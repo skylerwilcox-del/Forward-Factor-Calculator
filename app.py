@@ -190,185 +190,127 @@ def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return oc.calls.copy(), oc.puts.copy()
 
 # =========================
-# Earnings — robust next-event fetch and classification
+# Earnings — robust next-event fetch (ALWAYS returns a date if available)
 # =========================
-def _as_et(dt: pd.Timestamp | datetime | str | date) -> Optional[datetime]:
-    """Convert to ET; if value appears date-only, return None (caller will expand proxies)."""
-    try:
-        if isinstance(dt, date) and not isinstance(dt, datetime):
-            return None
-        if isinstance(dt, str):
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", dt):
-                return None
-            ts = pd.to_datetime(dt, utc=True, errors="coerce")
-            if pd.isna(ts):
-                return None
-            return ts.tz_convert("America/New_York").to_pydatetime()
-        if isinstance(dt, pd.Timestamp):
-            if dt.tzinfo is None:
-                if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-                    return None
-                dt = dt.tz_localize(UTC)
-            else:
-                dt = dt.tz_convert(UTC)
-            return dt.tz_convert(EASTERN).to_pydatetime()
-        if isinstance(dt, datetime):
-            if dt.tzinfo is None:
-                if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-                    return None
-                dt = dt.replace(tzinfo=UTC)
-            return dt.astimezone(EASTERN)
-    except Exception:
-        return None
-    return None
-
-def _expand_proxies_for_date(d: date) -> List[datetime]:
-    """BMO and AMC proxies for date-only values (ET)."""
-    return [
-        datetime.combine(d, time(8,30)).replace(tzinfo=EASTERN),   # BMO
-        datetime.combine(d, time(16,1)).replace(tzinfo=EASTERN),   # AMC
-    ]
-
-def _extract_dates_from_get_earnings_dates(df: pd.DataFrame) -> List[datetime]:
-    """
-    yfinance may return:
-    - DatetimeIndex named 'Earnings Date'
-    - or a column 'Earnings Date'
-    Normalize both to ET datetimes (with None meaning date-only → handled by caller).
-    """
-    out: List[datetime] = []
+def _extract_dates_from_get_earnings_dates(df: pd.DataFrame) -> List[date]:
+    """Normalize any structure returned by yfinance.get_earnings_dates into plain Python dates."""
+    out: List[date] = []
     if df is None or df.empty:
         return out
 
-    # 1) Index path (most common)
+    # Index-style
     if isinstance(df.index, (pd.DatetimeIndex, pd.Index)) and str(getattr(df.index, "name", "")).lower().startswith("earnings"):
         for val in df.index.tolist():
-            # Keep raw; caller will run _as_et (which returns None for date-only midnight)
-            out.append(val)
+            try:
+                dt = pd.to_datetime(val, errors="coerce").date()
+                if isinstance(dt, date):
+                    out.append(dt)
+            except Exception:
+                continue
 
-    # 2) Column path (older variants / some forks)
+    # Column-style
     if "Earnings Date" in df.columns:
-        out.extend(df["Earnings Date"].tolist())
+        for val in df["Earnings Date"].tolist():
+            try:
+                dt = pd.to_datetime(val, errors="coerce").date()
+                if isinstance(dt, date):
+                    out.append(dt)
+            except Exception:
+                continue
 
-    # Dedup while preserving order
-    seen = set()
-    uniq = []
-    for v in out:
-        key = str(v)
-        if key not in seen:
-            seen.add(key)
-            uniq.append(v)
+    # Deduplicate preserving order
+    seen, uniq = set(), []
+    for d in out:
+        if d not in seen:
+            seen.add(d)
+            uniq.append(d)
     return uniq
 
 @_cache_wrapper(900)
-def get_next_earnings_event_et(ticker: str) -> Optional[datetime]:
+def get_next_earnings_date_only(ticker: str) -> Optional[date]:
     """
-    Returns the earliest earnings datetime in ET that is >= (today ET - 1 day).
-    Gathers from get_earnings_dates (index or column), calendar, and info/fast_info; robust to date-only.
+    Returns the earliest *calendar date* (ET) of the next earnings event, if known.
+    Uses multiple fallbacks and tolerates yfinance schema differences.
     """
     tk = yf.Ticker(ticker)
-    now_et = datetime.now(EASTERN)
-    floor = (now_et - timedelta(days=1)).replace(microsecond=0)
+    today_et = datetime.now(EASTERN).date()
+    floor = today_et - timedelta(days=1)
 
-    candidates: List[datetime] = []
+    candidates: List[date] = []
 
-    # 1) get_earnings_dates (index or column)
+    # 1) get_earnings_dates()
     try:
         df = tk.get_earnings_dates(limit=24)
-        vals = _extract_dates_from_get_earnings_dates(df) if df is not None else []
-        for val in vals:
-            dt_et = _as_et(val)
-            if dt_et is not None:
-                candidates.append(dt_et.replace(microsecond=0))
-            else:
-                # date-only → add BMO/AMC proxies
-                d = (val.date() if isinstance(val, (pd.Timestamp, datetime)) else
-                     val if isinstance(val, date) else
-                     pd.to_datetime(val, errors="coerce").date())
-                if isinstance(d, date):
-                    for p in _expand_proxies_for_date(d):
-                        candidates.append(p.replace(microsecond=0))
+        candidates.extend(_extract_dates_from_get_earnings_dates(df))
     except Exception:
         pass
 
-    # 2) calendar (dict or df-like)
+    # 2) calendar (DataFrame-like or dict-like)
     try:
         cal = tk.calendar
-        candidate = None
-        # Some yfinance builds put the date in index, others as dict-like
+        raw = None
         if hasattr(cal, "index"):
-            # Try index value by common keys
-            for key in ["Earnings Date","EarningsDate","Earnings"]:
-                if key in list(cal.index):
-                    candidate = cal.loc[key].values[0]
+            for k in ["Earnings Date","EarningsDate","Earnings"]:
+                if k in list(cal.index):
+                    vals = cal.loc[k].values
+                    raw = vals[0] if len(vals) else None
                     break
-        if candidate is None and isinstance(cal, dict):
-            candidate = cal.get("Earnings Date") or cal.get("EarningsDate")
-        if candidate is not None:
-            dt_et = _as_et(candidate)
-            if dt_et is not None:
-                candidates.append(dt_et.replace(microsecond=0))
-            else:
-                d = (candidate.date() if isinstance(candidate, (pd.Timestamp, datetime)) else
-                     candidate if isinstance(candidate, date) else
-                     pd.to_datetime(candidate, errors="coerce").date())
+        if raw is None and isinstance(cal, dict):
+            raw = cal.get("Earnings Date") or cal.get("EarningsDate") or cal.get("Earnings")
+        if raw is not None:
+            try:
+                d = pd.to_datetime(raw, errors="coerce").date()
                 if isinstance(d, date):
-                    for p in _expand_proxies_for_date(d):
-                        candidates.append(p.replace(microsecond=0))
+                    candidates.append(d)
+            except Exception:
+                pass
     except Exception:
         pass
 
-    # 3) info/fast_info
-    for src in [tk.info, getattr(tk, "fast_info", {})]:
+    # 3) info / fast_info variants (can be array-like range)
+    for src in [getattr(tk, "fast_info", {}), tk.info if isinstance(getattr(tk, "info", {}), dict) else {}]:
         if not isinstance(src, dict):
             continue
-        for key in ("Earnings Date", "earningsDate", "earnings_date", "nextEarningsDate"):
+        for key in ("earningsDate","Earnings Date","earnings_date","nextEarningsDate"):
             try:
                 val = src.get(key)
                 if val is None:
                     continue
+                # Some builds give a tuple/list [start, end]
                 if isinstance(val, (list, tuple, pd.Series, pd.Index)) and len(val) > 0:
                     val = val[0]
-                dt_et = _as_et(val)
-                if dt_et is not None:
-                    candidates.append(dt_et.replace(microsecond=0))
-                else:
-                    d = (val.date() if isinstance(val, (pd.Timestamp, datetime)) else
-                         val if isinstance(val, date) else
-                         pd.to_datetime(val, errors="coerce").date())
-                    if isinstance(d, date):
-                        for p in _expand_proxies_for_date(d):
-                            candidates.append(p.replace(microsecond=0))
+                d = pd.to_datetime(val, errors="coerce").date()
+                if isinstance(d, date):
+                    candidates.append(d)
             except Exception:
                 continue
 
-    if not candidates:
-        return None
+    fut = sorted({d for d in candidates if d >= floor})
+    return fut[0] if fut else None
 
-    fut = [c for c in candidates if c >= floor]
-    if not fut:
-        return None
-    return sorted(set(fut))[0]
+def earnings_label_for_pair_date_only(exp1: str, exp2: str, next_earn_date: Optional[date]) -> Tuple[str, bool]:
+    """
+    Build a display label using ONLY the calendar date (no time-of-day) and
+    return (label, invalid_before_exp1_flag).
 
-def earnings_label_for_pair(exp1: str, exp2: str, next_evt_et: Optional[datetime]) -> Optional[str]:
-    """Return 'YYYY-MM-DD BMO/AMC/? ≤Exp1|Exp1–Exp2|>Exp2' or None."""
-    if next_evt_et is None:
-        return None
+    Rules:
+      - Always show the date if available.
+      - INVALID if earnings_date <= exp1_date (conservative; BMO/AMC unknown).
+      - Otherwise annotate whether it's between Exp1 and Exp2 or after Exp2.
+    """
+    if next_earn_date is None:
+        return "—", False
+
     d1 = _expiry_to_date(exp1)
     d2 = _expiry_to_date(exp2)
     if not d1 or not d2:
-        return None
+        return str(next_earn_date), False
 
-    # infer TOD label
-    h = next_evt_et.hour + next_evt_et.minute/60
-    tod = "BMO" if h < 9.5 else ("MID" if h < 16.0 else "AMC")
-    base = f"{next_evt_et.date()} {tod}"
-
-    if next_evt_et <= _market_close_et(d1):
-        return f"{base} ≤Exp1"
-    if next_evt_et <= _market_close_et(d2):
-        return f"{base} Exp1–Exp2"
-    return f"{base} >Exp2"
+    if next_earn_date <= d1:
+        return f"{next_earn_date}  ≤Exp1 — INVALID", True
+    if next_earn_date <= d2:
+        return f"{next_earn_date}  Exp1–Exp2", False
+    return f"{next_earn_date}  >Exp2", False
 
 # =========================
 # 3M Avg Volume ranking
@@ -569,8 +511,8 @@ def screen_ticker(ticker: str) -> List[Dict]:
     add_pair("30–90", e30, e90)
     add_pair("60–90", e60, e90)
 
-    # Next earnings (always displayed)
-    next_evt = get_next_earnings_event_et(ticker)
+    # Next earnings DATE (date-only; always displayed if available)
+    next_earn_date = get_next_earnings_date_only(ticker)
 
     rows = []
     for label, (exp1, dte1), (exp2, dte2) in pairs:
@@ -582,10 +524,11 @@ def screen_ticker(ticker: str) -> List[Dict]:
         fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
         _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
 
-        earn_display = earnings_label_for_pair(exp1, exp2, next_evt)
+        earn_display, invalid = earnings_label_for_pair_date_only(exp1, exp2, next_earn_date)
+
         tags = []
-        if earn_display and ("≤Exp1" in earn_display or "Exp1–Exp2" in earn_display):
-            tags.append("earn")
+        if invalid:
+            tags.append("earn_invalid")
         if ff is not None and ff >= 0.20:
             tags.append("hot")
 
@@ -596,7 +539,7 @@ def screen_ticker(ticker: str) -> List[Dict]:
             "fwd_vol": f"{(fwd_sigma*100):.2f}%" if fwd_sigma is not None else "—",
             "ff": f"{(ff*100):.2f}%" if ff is not None else "—",
             "cal_debit": f"{debit:.2f}" if debit is not None else "—",
-            "earn_in_window": earn_display if earn_display else "—",
+            "earn_in_window": earn_display,  # ALWAYS filled when we have a date
             "_tags": tags,
         })
     return rows
@@ -779,26 +722,35 @@ else:
     sort_key = LABEL_TO_KEY.get(sort_label, "ff")
     df_sorted = sort_df(df_current, sort_key, sort_ascending)
     have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
+
+    # Derive a helper column to style INVALID earnings dates
+    invalid_mask = df_sorted["_tags"].apply(lambda t: isinstance(t, (list, tuple, set)) and ("earn_invalid" in t))
     df_display = df_sorted[have_keys].copy()
     df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
+    df_display["_invalid_earn"] = invalid_mask.values  # not shown, just for styling lookup
 
-    tags_series = df_sorted["_tags"] if "_tags" in df_sorted.columns else pd.Series([[]]*len(df_sorted), index=df_sorted.index)
+    # Styling: only color the "Earnings Date" cell yellow when invalid; keep FF hot rows greenish
+    def _style_earnings_col(col: pd.Series):
+        # col is the visible "Earnings Date" column
+        # We need access to the hidden invalid flags aligned by index
+        flags = df_display["_invalid_earn"]
+        styles = []
+        for idx, _ in col.items():
+            styles.append("background-color:#fff59d; color:#000;" if bool(flags.loc[idx]) else "")
+        return styles
 
-    def _highlight_row(row: pd.Series):
-        tags = tags_series.iloc[row.name] if row.name in tags_series.index else []
-        earn = isinstance(tags, (list, tuple, set)) and ("earn" in tags)
+    def _style_hot_rows(row: pd.Series):
+        # Soft green when FF >= 0.20 (but don't override the earnings cell style)
+        # We'll set background for all cells lightly; the yellow cell stays yellow via precedence
+        i = row.name
+        tags = df_sorted["_tags"].iloc[i] if i in df_sorted.index else []
         hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
-        color = "#ffffff"
-        if earn and hot:
-            color = "#ffe0b2"  # both
-        elif earn:
-            color = "#fff9c4"  # earnings ≤ Exp2
-        elif hot:
-            color = "#dcedc8"  # FF >= 0.20
-        return [f"background-color:{color}; color:#000000;"] * len(row)
+        base = "background-color:#dcedc8; color:#000;" if hot else ""
+        return [base] * len(row)
 
-    styled = (df_display.style
-              .apply(_highlight_row, axis=1)
+    styled = (df_display.drop(columns=["_invalid_earn"]).style
+              .apply(_style_hot_rows, axis=1)
+              .apply(_style_earnings_col, subset=["Earnings Date"])
               .set_properties(**{"border":"1px solid #bbb","color":"#000","font-size":"14px"}))
 
     st.markdown("""
@@ -811,7 +763,7 @@ else:
     """, unsafe_allow_html=True)
 
     st.markdown(styled.to_html(), unsafe_allow_html=True)
-    st.caption("Legend:  ≤Exp1 = before short leg;  Exp1–Exp2 = between legs;  >Exp2 = after long leg.  🟩 FF ≥ 0.20  🟨 Earnings ≤Exp2")
+    st.caption("Legend:  ≤Exp1 = before short leg (marked INVALID);  Exp1–Exp2 = between legs;  >Exp2 = after long leg.  🟩 FF ≥ 0.20  🟨 Earnings ≤Exp1")
 
 st.markdown(
     "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
