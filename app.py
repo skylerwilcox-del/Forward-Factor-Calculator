@@ -575,56 +575,84 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
 # =========================
 # Screener
 # =========================
-def _nearest(ed, target):
-    return min(ed, key=lambda x: (abs(x[1] - target), x[1])) if ed else None
+def _sort_exp_list(ed: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    """Sort expiry list by DTE ascending."""
+    return sorted(ed, key=lambda x: x[1])
+
+def _first_ge_after(ed_sorted: List[Tuple[str, int]], min_days: int, gt_days: Optional[int] = None):
+    """
+    Return first (expiry, dte) where dte >= min_days and (gt_days is None or dte > gt_days).
+    """
+    for e, d in ed_sorted:
+        if d >= min_days and (gt_days is None or d > gt_days):
+            return (e, d)
+    return None
+
+def _build_target_pairs(ed: List[Tuple[str, int]]) -> List[Tuple[str, Tuple[str,int], Tuple[str,int]]]:
+    """
+    Build the canonical 5 calendar pairs using first-≥ targets and strictly increasing expiries.
+    Returns list of (label, left_exp, right_exp) where each exp is (expiry_str, dte_int).
+    """
+    eds = _sort_exp_list(ed)
+
+    # Anchors (left legs)
+    a7   = _first_ge_after(eds, 7)
+    a30  = _first_ge_after(eds, 30)
+    a60  = _first_ge_after(eds, 60)
+
+    # Right legs must be strictly later than left legs
+    b14  = _first_ge_after(eds, 14,  gt_days=a7[1]  if a7  else None)  if a7  else None
+    b30  = _first_ge_after(eds, 30,  gt_days=a7[1]  if a7  else None)  if a7  else None
+    b60  = _first_ge_after(eds, 60,  gt_days=a30[1] if a30 else None)  if a30 else None
+    b90a = _first_ge_after(eds, 90,  gt_days=a30[1] if a30 else None)  if a30 else None
+    b90b = _first_ge_after(eds, 90,  gt_days=a60[1] if a60 else None)  if a60 else None
+
+    pairs: List[Tuple[str, Tuple[str,int], Tuple[str,int]]] = []
+    def add(name, L, R):
+        if L and R and R[1] > L[1]:
+            pairs.append((name, L, R))
+
+    add("7–14",  a7,  b14)
+    add("7–30",  a7,  b30)
+    add("30–60", a30, b60)
+    add("30–90", a30, b90a)
+    add("60–90", a60, b90b)
+
+    return pairs
+
 
 @_cache_wrapper(900)
 def screen_ticker(ticker: str) -> List[Dict]:
     """
-    Returns 0+ rows for valid option pairs. If we can't get spot or expiries,
-    we return [] so no blank placeholder rows ever appear.
+    Build rows for up to five canonical calendar pairs per ticker:
+    7–14, 7–30, 30–60, 30–90, 60–90.
+    We choose the first expiry >= each target and require the right leg to be strictly later.
     """
     spot = get_spot(ticker)
     if spot is None:
-        return []  # <-- no placeholders
+        return []  # no placeholders
 
     expiries = get_options(ticker)
     if not expiries:
-        return []  # <-- no placeholders
+        return []  # no placeholders
 
     ed = [(e, _calc_dte(e)) for e in expiries]
+    pairs = _build_target_pairs(ed)
 
-    # Anchors
-    e7, e14, e30, e60, e90 = (
-        _nearest(ed, 7), _nearest(ed, 14), _nearest(ed, 30), _nearest(ed, 60), _nearest(ed, 90)
-    )
-
-    pairs = []
-    def add_pair(name, a, b):
-        if a and b and b[1] > a[1]:
-            pairs.append((name, a, b))
-    add_pair("7–14", e7, e14)
-    add_pair("7–30", e7, e30)
-    add_pair("30–60", e30, e60)
-    add_pair("30–90", e30, e90)
-    add_pair("60–90", e60, e90)
-
+    # Fetch next earnings date once
     next_earn_date = get_next_earnings_date_only(ticker)
-    rows = []
 
+    rows: List[Dict] = []
     for label, (exp1, dte1), (exp2, dte2) in pairs:
         iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
         earn_display, invalid = earnings_label_for_pair_date_only(exp1, exp2, next_earn_date)
 
-        # If both IVs are missing AND there is no earnings date info, skip this pair
-        if iv1 is None and iv2 is None and (earn_display == "—"):
-            continue
-
-        tags = []
+        tags: List[str] = []
         if invalid:
             tags.append("earn_invalid")
 
         if iv1 is None or iv2 is None:
+            # Still emit the row so every pair shows up consistently
             rows.append({
                 "ticker": ticker, "pair": label,
                 "exp1": exp1, "dte1": dte1, "iv1": "—",
@@ -901,3 +929,4 @@ else:
 
         st.markdown(styled.to_html(), unsafe_allow_html=True)
         st.caption("Legend:  ≤Exp1 = before short leg (INVALID, sorted last);  Exp1–Exp2 = between legs;  >Exp2 = after long leg.  🟩 FF ≥ 0.20  🟨 Earnings ≤Exp1")
+
