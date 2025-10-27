@@ -94,7 +94,8 @@ def _normalize_tickers(raw: str) -> List[str]:
     return out
 
 def _is_clean_us_symbol(sym: str) -> bool:
-    return bool(re.fullmatch(r"[A-Z0-9]{1,5}(-[A-Z0-9]{1,2})?", sym))
+    # Allow dot tickers like BRK.B also
+    return bool(re.fullmatch(r"[A-Z0-9]{1,5}(?:[.\-][A-Z0-9]{1,2})?", sym))
 
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
@@ -169,12 +170,22 @@ def _safe_single_download(ticker, period, interval):
 @_cache_wrapper(1800)
 def get_spot(ticker: str) -> Optional[float]:
     tk = yf.Ticker(ticker)
-    spot = tk.fast_info.get("last_price") or tk.info.get("regularMarketPrice")
-    if spot is None:
+    fi = getattr(tk, "fast_info", {}) or {}
+    # fast_info may be an object, not a dict
+    fi_get = getattr(fi, "get", None)
+    last_price = None
+    if callable(fi_get):
+        last_price = fi_get("last_price")
+    else:
+        last_price = getattr(fi, "last_price", None)
+    if last_price is None:
+        info = getattr(tk, "info", {}) or {}
+        last_price = info.get("regularMarketPrice")
+    if last_price is None:
         px = tk.history(period="1d")
         if not px.empty:
-            spot = float(px["Close"].iloc[-1])
-    return _first_float(spot)
+            last_price = float(px["Close"].iloc[-1])
+    return _first_float(last_price)
 
 @_cache_wrapper(1200)
 def get_options(ticker: str) -> List[str]:
@@ -190,106 +201,150 @@ def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return oc.calls.copy(), oc.puts.copy()
 
 # =========================
-# Earnings — make sure we ALWAYS fill the column when any date exists
+# Earnings — ALWAYS fill if any date exists
 # =========================
-def _extract_dates_from_get_earnings_dates(df: pd.DataFrame) -> List[date]:
-    """Normalize any structure returned by yfinance.get_earnings_dates into plain Python dates."""
+def _to_date_list(values) -> List[date]:
     out: List[date] = []
-    if df is None or df.empty:
+    if values is None:
         return out
-
-    # Index-style (most common in yfinance)
-    if isinstance(df.index, (pd.DatetimeIndex, pd.Index)):
-        idx_name = str(getattr(df.index, "name", "") or "").lower()
-        if "earnings" in idx_name:
-            for val in df.index.tolist():
-                try:
-                    d = pd.to_datetime(val, errors="coerce").date()
-                    if isinstance(d, date):
-                        out.append(d)
-                except Exception:
-                    pass
-
-    # Column-style (some builds)
-    if "Earnings Date" in df.columns:
-        for val in df["Earnings Date"].tolist():
+    # Accept scalar, list/tuple/Series/Index, including ranges like [start, end]
+    if not isinstance(values, (list, tuple, pd.Series, pd.Index)):
+        values = [values]
+    for v in values:
+        try:
+            d = pd.to_datetime(v, errors="coerce")
+            if pd.isna(d):
+                continue
+            # If Timestamp, drop time zone and time
+            out.append(d.tz_convert(EASTERN).date() if getattr(d, "tzinfo", None) is not None else d.date())
+        except Exception:
+            # String parse fallback
             try:
-                d = pd.to_datetime(val, errors="coerce").date()
-                if isinstance(d, date):
-                    out.append(d)
+                d = pd.to_datetime(str(v), errors="coerce")
+                if not pd.isna(d):
+                    out.append(d.date())
             except Exception:
                 pass
-
-    # Dedup preserving order
+    # Deduplicate preserving order
     seen, uniq = set(), []
     for d in out:
-        if d not in seen:
+        if isinstance(d, date) and d not in seen:
             seen.add(d)
             uniq.append(d)
     return uniq
 
-# Cache with a very short TTL so refreshes propagate quickly
+def _extract_dates_from_get_earnings_dates(df: pd.DataFrame) -> List[date]:
+    out: List[date] = []
+    if df is None or df.empty:
+        return out
+    # Typical yfinance structure: index is DatetimeIndex named "Earnings Date"
+    if isinstance(df.index, pd.DatetimeIndex) or isinstance(df.index, pd.Index):
+        out.extend(_to_date_list(list(df.index)))
+    # Some builds put "Earnings Date" in a column
+    for col_name in ["Earnings Date", "EarningsDate", "Date"]:
+        if col_name in df.columns:
+            out.extend(_to_date_list(df[col_name].tolist()))
+    # Clean + dedup
+    seen, uniq = set(), []
+    for d in out:
+        if isinstance(d, date) and d not in seen:
+            seen.add(d)
+            uniq.append(d)
+    return uniq
+
+# Cache with a short TTL so refreshes propagate quickly
 @st.cache_data(ttl=300, show_spinner=False)
 def get_next_earnings_date_only(ticker: str) -> Optional[date]:
     """
-    Returns the earliest *calendar date* (ET) of the next earnings event, if known.
-    Uses multiple fallbacks and tolerates yfinance schema differences.
+    Returns the earliest future (or very-recent) calendar date (ET) of the next earnings event, if known.
+    Multiple fallbacks support yfinance schema differences:
+      - Ticker.get_earnings_dates(limit=24)
+      - Ticker.earnings_dates (if available in this yfinance build)
+      - Ticker.calendar (DataFrame or dict)
+      - Ticker.fast_info / Ticker.info keys: earningsDate / nextEarningsDate etc
+      - Handles tuple/list ranges like [start, end] by taking the first
     """
     tk = yf.Ticker(ticker)
     today_et = datetime.now(EASTERN).date()
-    floor = today_et - timedelta(days=1)
+    floor = today_et - timedelta(days=1)  # allow yesterday in case of same-day ET timing
 
     candidates: List[date] = []
 
     # 1) get_earnings_dates()
     try:
-        df = tk.get_earnings_dates(limit=24)
-        candidates.extend(_extract_dates_from_get_earnings_dates(df))
+        df1 = tk.get_earnings_dates(limit=32)
+        candidates.extend(_extract_dates_from_get_earnings_dates(df1))
     except Exception:
         pass
 
-    # 2) calendar (DataFrame-like or dict-like)
+    # 1b) .earnings_dates (if present in some yfinance versions)
+    try:
+        ed_attr = getattr(tk, "earnings_dates", None)
+        if ed_attr is not None:
+            if isinstance(ed_attr, pd.DataFrame):
+                candidates.extend(_extract_dates_from_get_earnings_dates(ed_attr))
+            else:
+                candidates.extend(_to_date_list(ed_attr))
+    except Exception:
+        pass
+
+    # 2) calendar (DF-like or dict-like)
     try:
         cal = tk.calendar
         raw = None
-        if hasattr(cal, "index"):
-            # Sometimes values are across columns; take the first non-null
-            if "Earnings Date" in list(cal.index) or "EarningsDate" in list(cal.index):
-                key = "Earnings Date" if "Earnings Date" in list(cal.index) else "EarningsDate"
-                row = cal.loc[key]
-                # row may be Series with Timestamp/str
+        if isinstance(cal, pd.DataFrame) and not cal.empty:
+            # Keys sometimes appear in the index
+            idx = [str(x) for x in list(cal.index)]
+            possible = [k for k in ["Earnings Date", "EarningsDate", "Earnings"] if k in idx]
+            if possible:
+                row = cal.loc[possible[0]]
+                # Take first non-null cell
                 for v in list(row.values):
                     if pd.notna(v):
                         raw = v
                         break
         if raw is None and isinstance(cal, dict):
-            raw = cal.get("Earnings Date") or cal.get("EarningsDate")
+            for k in ["Earnings Date", "EarningsDate", "Earnings"]:
+                if cal.get(k) is not None:
+                    raw = cal.get(k)
+                    break
         if raw is not None:
-            d = pd.to_datetime(raw, errors="coerce").date()
-            if isinstance(d, date):
-                candidates.append(d)
+            candidates.extend(_to_date_list(raw))
     except Exception:
         pass
 
-    # 3) info / fast_info variants (can be array-like range)
-    for src in [getattr(tk, "fast_info", {}), tk.info if isinstance(getattr(tk, "info", {}), dict) else {}]:
-        if not isinstance(src, dict):
-            continue
-        for key in ("earningsDate","Earnings Date","earnings_date","nextEarningsDate"):
+    # 3) info / fast_info (handle dict vs object)
+    fi = getattr(tk, "fast_info", {}) or {}
+    fi_get = getattr(fi, "get", None)
+    fi_dict = fi if isinstance(fi, dict) or callable(fi_get) else {}
+    info = getattr(tk, "info", {}) if isinstance(getattr(tk, "info", {}), dict) else {}
+
+    def _get_from_mapping(mapping):
+        vals = []
+        for key in ("earningsDate","Earnings Date","earnings_date","nextEarningsDate","nextEarningsDateTime"):
             try:
-                val = src.get(key)
-                if val is None:
+                v = mapping.get(key)
+                if v is None:
                     continue
-                # Some builds give a tuple/list [start, end]
-                if isinstance(val, (list, tuple, pd.Series, pd.Index)) and len(val) > 0:
-                    val = val[0]
-                d = pd.to_datetime(val, errors="coerce").date()
-                if isinstance(d, date):
-                    candidates.append(d)
+                vals.extend(_to_date_list(v))
             except Exception:
                 continue
+        return vals
 
-    fut = sorted({d for d in candidates if d >= floor})
+    if callable(fi_get):
+        candidates.extend(_get_from_mapping(fi))
+    else:
+        # Try attribute access if not dict-like
+        for key in ("earningsDate","Earnings Date","earnings_date","nextEarningsDate","nextEarningsDateTime"):
+            v = getattr(fi, key, None)
+            if v is not None:
+                candidates.extend(_to_date_list(v))
+
+    if isinstance(info, dict):
+        candidates.extend(_get_from_mapping(info))
+
+    # Normalize and choose the soonest not-too-old date
+    fut = sorted({d for d in candidates if isinstance(d, date) and d >= floor})
     return fut[0] if fut else None
 
 def earnings_label_for_pair_date_only(exp1: str, exp2: str, next_earn_date: Optional[date]) -> Tuple[str, bool]:
