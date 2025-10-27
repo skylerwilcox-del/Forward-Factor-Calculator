@@ -187,8 +187,10 @@ def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_next_earnings_date(ticker: str) -> Optional[date]:
+    """Return the next *future* earnings date as a date(), or None if unknown."""
     today = _now_pacific_date()
     tk = yf.Ticker(ticker)
+    # Primary: get_earnings_dates
     try:
         df = tk.get_earnings_dates(limit=8)
         if df is not None and not df.empty:
@@ -199,7 +201,9 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
                 return min(fut)
     except Exception:
         pass
-    for src in (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {})):
+    # Fallbacks
+    try_sources = (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {}))
+    for src in try_sources:
         if src is None:
             continue
         for key in ("Earnings Date", "earningsDate", "earnings_date", "nextEarningsDate"):
@@ -215,8 +219,236 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
     return None
 
 # =========================
+# IV/FF calculations
+# =========================
+def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
+    calls, puts = get_chain(ticker, expiry)
+    if calls.empty and puts.empty:
+        return None
+    strikes = pd.Index(sorted(set(calls["strike"]).union(set(puts["strike"])))).astype(float)
+    if len(strikes) == 0:
+        return None
+    atm = float(min(strikes, key=lambda s: abs(s - spot)))
+    def iv_from(df: pd.DataFrame) -> Optional[float]:
+        if df is None or df.empty:
+            return None
+        row = df.loc[df["strike"].astype(float) == atm]
+        return None if row.empty else _first_float(row["impliedVolatility"].iloc[0])
+    c_iv, p_iv = iv_from(calls), iv_from(puts)
+    if c_iv is None and p_iv is None:
+        return None
+    if c_iv is None:
+        return p_iv * 100.0
+    if p_iv is None:
+        return c_iv * 100.0
+    return 0.5 * (c_iv + p_iv) * 100.0
+
+def common_atm_strike(ticker: str, exp1: str, exp2: str, spot: float) -> Optional[float]:
+    c1, p1 = get_chain(ticker, exp1)
+    c2, p2 = get_chain(ticker, exp2)
+    s1 = set(map(float, pd.Index(sorted(set(c1["strike"]).union(set(p1["strike"])))))) if not (c1.empty and p1.empty) else set()
+    s2 = set(map(float, pd.Index(sorted(set(c2["strike"]).union(set(p2["strike"])))))) if not (c2.empty and p2.empty) else set()
+    inter = list(s1.intersection(s2))
+    return float(min(inter, key=lambda s: abs(s - spot))) if inter else None
+
+def call_mid_at(calls: pd.DataFrame, strike: float) -> Optional[float]:
+    if calls is None or calls.empty:
+        return None
+    row = calls.loc[calls["strike"].astype(float) == strike]
+    return None if row.empty else _safe_mid(row.iloc[0])
+
+def calendar_debit(ticker: str, e1: str, e2: str, spot: float):
+    c1, _ = get_chain(ticker, e1)
+    c2, _ = get_chain(ticker, e2)
+    strike = common_atm_strike(ticker, e1, e2, spot)
+    if strike is None:
+        return None, None, None, None
+    short_mid, long_mid = call_mid_at(c1, strike), call_mid_at(c2, strike)
+    if short_mid is None or long_mid is None:
+        return strike, short_mid, long_mid, None
+    return strike, short_mid, long_mid, long_mid - short_mid
+
+def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
+    denom = T2 - T1
+    if denom <= 0:
+        return None, None
+    fwd_var = (s2**2 * T2 - s1**2 * T1) / denom
+    if fwd_var < 0:
+        return None, None
+    fwd_sigma = math.sqrt(fwd_var)
+    ff = None if fwd_sigma == 0 else (s1 - fwd_sigma) / fwd_sigma
+    return fwd_sigma, ff
+
+# =========================
+# Screener (with earnings gating per strategy)
+# =========================
+@st.cache_data(ttl=900, show_spinner=False)
+def screen_ticker(ticker: str) -> List[Dict]:
+    spot = get_spot(ticker)
+    if spot is None:
+        return [{
+            "ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
+            "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
+            "cal_debit": "—","earn_in_window": "—","_tags": ["no_spot"]
+        }]
+    expiries = get_options(ticker)
+    if not expiries:
+        return [{
+            "ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
+            "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
+            "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"]
+        }]
+    ed = [(e, _calc_dte(e)) for e in expiries]
+    nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
+
+    # Anchor expiries
+    e7, e14 = nearest(7), nearest(14)
+    e30, e60, e90 = nearest(30), nearest(60), nearest(90)
+
+    pairs = []
+    # Short-term
+    if e7 and e14 and e14[1] > e7[1]:   pairs.append(("7–14", e7, e14))
+    if e7 and e30 and e30[1] > e7[1]:   pairs.append(("7–30", e7, e30))
+    # Mid-term
+    if e30 and e60 and e60[1] > e30[1]: pairs.append(("30–60", e30, e60))
+    if e30 and e90 and e90[1] > e30[1]: pairs.append(("30–90", e30, e90))
+    if e60 and e90 and e90[1] > e60[1]: pairs.append(("60–90", e60, e90))
+
+    earn_dt = get_next_earnings_date(ticker)
+    rows = []
+
+    for label, (exp1, dte1), (exp2, dte2) in pairs:
+        # Earnings gating per your rules:
+        # 1) earnings before exp1 -> BLOCK (skip pair)
+        # 2) earnings between [exp1, exp2] -> ALLOW + FLAG + show earnings date
+        # 3) earnings after exp2 or None -> ALLOW (no flag, no date shown)
+        earn_txt = "—"
+        tags: List[str] = []
+
+        if earn_dt:
+            e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
+            if e1d and earn_dt < e1d:
+                # BLOCK: do not include this pair
+                continue
+            if e1d and e2d and e1d <= earn_dt <= e2d:
+                earn_txt = earn_dt.strftime("%Y-%m-%d")
+                tags.append("earn")  # flagged but allowed
+
+        iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
+        if iv1 is None or iv2 is None:
+            # Skip incomplete IV data to avoid blank rows
+            continue
+
+        s1, s2 = iv1/100.0, iv2/100.0
+        T1, T2 = dte1/365.0, dte2/365.0
+        fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
+        _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
+
+        if ff is not None and ff >= 0.20:
+            tags.append("hot")
+
+        rows.append({
+            "ticker": ticker, "pair": label,
+            "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%",
+            "exp2": exp2, "dte2": dte2, "iv2": f"{iv2:.2f}%",
+            "fwd_vol": f"{(fwd_sigma*100):.2f}%" if fwd_sigma is not None else "—",
+            "ff": f"{(ff*100):.2f}%" if ff is not None else "—",
+            "cal_debit": f"{debit:.2f}" if debit is not None else "—",
+            "earn_in_window": earn_txt,
+            "_tags": tags,
+        })
+
+    return rows
+
+def scan_many(tickers: List[str]) -> pd.DataFrame:
+    rows: List[Dict] = []
+    if not tickers:
+        return pd.DataFrame(rows)
+    progress = st.progress(0.0, text="Scanning option chains…")
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(tickers)))) as ex:
+        fut_map = {ex.submit(screen_ticker, t): t for t in tickers}
+        done = 0
+        for fut in as_completed(fut_map):
+            t = fut_map[fut]
+            try:
+                rows.extend(fut.result())
+            except Exception as e:
+                rows.append({"ticker": t, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
+                             "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
+                             "cal_debit": "—","earn_in_window": "—","_tags": [f"error:{type(e).__name__}"]})
+            done += 1
+            progress.progress(done / len(tickers), text=f"Scanned {t} ({done}/{len(tickers)})")
+    progress.empty()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    if "_tags" not in df.columns:
+        df["_tags"] = [[] for _ in range(len(df))]
+    return df
+
+# =========================
+# Sorting helpers (stable & robust)
+# =========================
+_BLANK_SET = {"", "-", "—", "–"}
+
+def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
+    s = series.copy()
+    s_str = s.astype(str).str.strip()
+    is_blank = s.isna() | s_str.isin(_BLANK_SET)
+
+    pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", "", regex=False), errors="coerce")
+    pct_mask = s_str.str.endswith("%") & ~pd.isna(pct_val)
+
+    cur_mask = s_str.str.match(r"^\(?\$\s*[\d,]+(?:\.\d+)?\)?$")
+    cur_core = (s_str
+        .str.replace(r"^\(", "", regex=True)
+        .str.replace(r"\)$", "", regex=True)
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip())
+    cur_val = pd.to_numeric(cur_core, errors="coerce")
+    cur_neg = s_str.str.startswith("(") & s_str.str.endswith(")")
+    cur_val = np.where(cur_neg, -cur_val, cur_val)
+
+    num_val_plain = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
+    num_key = np.where(~pd.isna(pct_val) & pct_mask, pct_val,
+              np.where(~pd.isna(cur_val) & cur_mask, cur_val, num_val_plain))
+    num_key = pd.to_numeric(num_key, errors="coerce")
+
+    dt = pd.to_datetime(s_str, errors="coerce", utc=True)
+    date_key = dt.view("int64")
+    text_key = s_str.str.lower()
+
+    is_num = ~pd.isna(num_key)
+    is_date = pd.isna(num_key) & ~pd.isna(date_key)
+    is_text = ~(is_num | is_date)
+
+    t_code = np.select([is_num, is_date, is_text], [0, 1, 2], default=2)
+
+    val = pd.Series(np.nan, index=s.index, dtype="object")
+    val[is_num] = num_key[is_num]
+    val[is_date] = date_key[is_date].astype("float64")
+    val[is_text] = text_key[is_text]
+
+    grp = np.where(is_blank, 1, 0)
+    t_code = np.where(is_blank, 9, t_code)
+    val = np.where(is_blank, "", val)
+
+    return pd.DataFrame({"_grp": grp, "_t": t_code, "_val": val}, index=s.index)
+
+def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
+    if df is None or df.empty or col not in df.columns:
+        return df
+    aux = _build_sort_columns(df[col])
+    return (df.join(aux)
+              .sort_values(by=["_grp","_t","_val"], ascending=[True, True, ascending], kind="mergesort")
+              .drop(columns=["_grp","_t","_val"])
+              .reset_index(drop=True))
+
+# =========================
 # 3M Avg Volume ranking — NO GATING
 # =========================
+@st.cache_data(ttl=1200, show_spinner=False)
 def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
     """
     Download 3mo daily data for a batch of tickers and compute:
@@ -335,213 +567,6 @@ def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
 
     full_final = pd.concat([top_stocks, pd.DataFrame(etf_rows)], ignore_index=True).reset_index(drop=True)
     return full_final
-
-# =========================
-# IV/FF calculations
-# =========================
-def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
-    calls, puts = get_chain(ticker, expiry)
-    if calls.empty and puts.empty:
-        return None
-    strikes = pd.Index(sorted(set(calls["strike"]).union(set(puts["strike"])))).astype(float)
-    if len(strikes) == 0:
-        return None
-    atm = float(min(strikes, key=lambda s: abs(s - spot)))
-    def iv_from(df: pd.DataFrame) -> Optional[float]:
-        if df is None or df.empty:
-            return None
-        row = df.loc[df["strike"].astype(float) == atm]
-        return None if row.empty else _first_float(row["impliedVolatility"].iloc[0])
-    c_iv, p_iv = iv_from(calls), iv_from(puts)
-    if c_iv is None and p_iv is None:
-        return None
-    if c_iv is None:
-        return p_iv * 100.0
-    if p_iv is None:
-        return c_iv * 100.0
-    return 0.5 * (c_iv + p_iv) * 100.0
-
-def common_atm_strike(ticker: str, exp1: str, exp2: str, spot: float) -> Optional[float]:
-    c1, p1 = get_chain(ticker, exp1)
-    c2, p2 = get_chain(ticker, exp2)
-    s1 = set(map(float, pd.Index(sorted(set(c1["strike"]).union(set(p1["strike"])))))) if not (c1.empty and p1.empty) else set()
-    s2 = set(map(float, pd.Index(sorted(set(c2["strike"]).union(set(p2["strike"])))))) if not (c2.empty and p2.empty) else set()
-    inter = list(s1.intersection(s2))
-    return float(min(inter, key=lambda s: abs(s - spot))) if inter else None
-
-def call_mid_at(calls: pd.DataFrame, strike: float) -> Optional[float]:
-    if calls is None or calls.empty:
-        return None
-    row = calls.loc[calls["strike"].astype(float) == strike]
-    return None if row.empty else _safe_mid(row.iloc[0])
-
-def calendar_debit(ticker: str, e1: str, e2: str, spot: float):
-    c1, _ = get_chain(ticker, e1)
-    c2, _ = get_chain(ticker, e2)
-    strike = common_atm_strike(ticker, e1, e2, spot)
-    if strike is None:
-        return None, None, None, None
-    short_mid, long_mid = call_mid_at(c1, strike), call_mid_at(c2, strike)
-    if short_mid is None or long_mid is None:
-        return strike, short_mid, long_mid, None
-    return strike, short_mid, long_mid, long_mid - short_mid
-
-def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
-    denom = T2 - T1
-    if denom <= 0:
-        return None, None
-    fwd_var = (s2**2 * T2 - s1**2 * T1) / denom
-    if fwd_var < 0:
-        return None, None
-    fwd_sigma = math.sqrt(fwd_var)
-    ff = None if fwd_sigma == 0 else (s1 - fwd_sigma) / fwd_sigma
-    return fwd_sigma, ff
-
-# =========================
-# Screener
-# =========================
-@st.cache_data(ttl=900, show_spinner=False)
-def screen_ticker(ticker: str) -> List[Dict]:
-    spot = get_spot(ticker)
-    if spot is None:
-        return [{"ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
-                 "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-                 "cal_debit": "—","earn_in_window": "—","_tags": ["no_spot"]}]
-    expiries = get_options(ticker)
-    if not expiries:
-        return [{"ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
-                 "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-                 "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"]}]
-    ed = [(e, _calc_dte(e)) for e in expiries]
-    nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
-
-    # Existing anchors
-    e30, e60, e90 = nearest(30), nearest(60), nearest(90)
-
-    # NEW: short-term anchors for 7–14 and 7–30
-    e7, e14 = nearest(7), nearest(14)
-
-    pairs = []
-    # NEW pairs first (ensure increasing DTE order)
-    if e7 and e14 and e14[1] > e7[1]:   pairs.append(("7–14", e7, e14))
-    if e7 and e30 and e30[1] > e7[1]:   pairs.append(("7–30", e7, e30))
-
-    # Existing pairs
-    if e30 and e60 and e60[1] > e30[1]: pairs.append(("30–60", e30, e60))
-    if e30 and e90 and e90[1] > e30[1]: pairs.append(("30–90", e30, e90))
-    if e60 and e90 and e90[1] > e60[1]: pairs.append(("60–90", e60, e90))
-
-    earn_dt = get_next_earnings_date(ticker)
-    rows = []
-    for label, (exp1, dte1), (exp2, dte2) in pairs:
-        iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
-        if iv1 is None or iv2 is None:
-            continue
-        s1, s2 = iv1/100.0, iv2/100.0
-        T1, T2 = dte1/365.0, dte2/365.0
-        fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
-        _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
-        earn_txt, tags = "—", []
-        if earn_dt:
-            e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
-            if e1d and e2d and min(e1d, e2d) <= earn_dt <= max(e1d, e2d):
-                earn_txt, tags = earn_dt.strftime("%Y-%m-%d"), ["earn"]
-        if ff is not None and ff >= 0.20:
-            tags.append("hot")
-        rows.append({
-            "ticker": ticker, "pair": label,
-            "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%",
-            "exp2": exp2, "dte2": dte2, "iv2": f"{iv2:.2f}%",
-            "fwd_vol": f"{(fwd_sigma*100):.2f}%" if fwd_sigma is not None else "—",
-            "ff": f"{(ff*100):.2f}%" if ff is not None else "—",
-            "cal_debit": f"{debit:.2f}" if debit is not None else "—",
-            "earn_in_window": earn_txt,
-            "_tags": tags,
-        })
-    return rows
-
-def scan_many(tickers: List[str]) -> pd.DataFrame:
-    rows: List[Dict] = []
-    if not tickers:
-        return pd.DataFrame(rows)
-    progress = st.progress(0.0, text="Scanning option chains…")
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(tickers)))) as ex:
-        fut_map = {ex.submit(screen_ticker, t): t for t in tickers}
-        done = 0
-        for fut in as_completed(fut_map):
-            t = fut_map[fut]
-            try:
-                rows.extend(fut.result())
-            except Exception as e:
-                rows.append({"ticker": t, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
-                             "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-                             "cal_debit": "—","earn_in_window": "—","_tags": [f"error:{type(e).__name__}"]})
-            done += 1
-            progress.progress(done / len(tickers), text=f"Scanned {t} ({done}/{len(tickers)})")
-    progress.empty()
-    df = pd.DataFrame(rows)
-    if "_tags" not in df.columns:
-        df["_tags"] = [[] for _ in range(len(df))]
-    return df
-
-# =========================
-# Sorting helpers (stable & robust)
-# =========================
-_BLANK_SET = {"", "-", "—", "–"}
-
-def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
-    s = series.copy()
-    s_str = s.astype(str).str.strip()
-    is_blank = s.isna() | s_str.isin(_BLANK_SET)
-
-    pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", "", regex=False), errors="coerce")
-    pct_mask = s_str.str.endswith("%") & ~pd.isna(pct_val)
-
-    cur_mask = s_str.str.match(r"^\(?\$\s*[\d,]+(?:\.\d+)?\)?$")
-    cur_core = (s_str
-        .str.replace(r"^\(", "", regex=True)
-        .str.replace(r"\)$", "", regex=True)
-        .str.replace("$", "", regex=False)
-        .str.replace(",", "", regex=False)
-        .str.strip())
-    cur_val = pd.to_numeric(cur_core, errors="coerce")
-    cur_neg = s_str.str.startswith("(") & s_str.str.endswith(")")
-    cur_val = np.where(cur_neg, -cur_val, cur_val)
-
-    num_val_plain = pd.to_numeric(s_str.str.replace(",", "", regex=False), errors="coerce")
-    num_key = np.where(~pd.isna(pct_val) & pct_mask, pct_val,
-              np.where(~pd.isna(cur_val) & cur_mask, cur_val, num_val_plain))
-    num_key = pd.to_numeric(num_key, errors="coerce")
-
-    dt = pd.to_datetime(s_str, errors="coerce", utc=True)
-    date_key = dt.view("int64")
-    text_key = s_str.str.lower()
-
-    is_num = ~pd.isna(num_key)
-    is_date = pd.isna(num_key) & ~pd.isna(date_key)
-    is_text = ~(is_num | is_date)
-
-    t_code = np.select([is_num, is_date, is_text], [0, 1, 2], default=2)
-
-    val = pd.Series(np.nan, index=s.index, dtype="object")
-    val[is_num] = num_key[is_num]
-    val[is_date] = date_key[is_date].astype("float64")
-    val[is_text] = text_key[is_text]
-
-    grp = np.where(is_blank, 1, 0)
-    t_code = np.where(is_blank, 9, t_code)
-    val = np.where(is_blank, "", val)
-
-    return pd.DataFrame({"_grp": grp, "_t": t_code, "_val": val}, index=s.index)
-
-def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
-    if df is None or df.empty or col not in df.columns:
-        return df
-    aux = _build_sort_columns(df[col])
-    return (df.join(aux)
-              .sort_values(by=["_grp","_t","_val"], ascending=[True, True, ascending], kind="mergesort")
-              .drop(columns=["_grp","_t","_val"])
-              .reset_index(drop=True))
 
 # =========================
 # UI
