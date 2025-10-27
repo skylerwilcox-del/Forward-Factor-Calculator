@@ -1,7 +1,8 @@
 import math
-from datetime import datetime, date
+from datetime import datetime, date, time, timedelta
 from typing import Optional, Tuple, List, Dict
 import re
+import zoneinfo
 
 import numpy as np
 import pandas as pd
@@ -13,8 +14,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =========================
 # App/session setup
 # =========================
-PACIFIC = pytz.timezone("America/Los_Angeles")
-EASTERN = pytz.timezone("America/New_York")
+PACIFIC = zoneinfo.ZoneInfo("America/Los_Angeles")
+EASTERN = zoneinfo.ZoneInfo("America/New_York")
+UTC = zoneinfo.ZoneInfo("UTC")
+
 st.set_page_config(page_title="Forward Vol Screener — Top 27 (3M Avg Vol, All US Stocks)", layout="wide")
 
 # Persistent session state
@@ -79,6 +82,10 @@ def _expiry_to_date(expiry_iso: str) -> Optional[date]:
     except Exception:
         return None
 
+def _market_close_et(d: date) -> datetime:
+    # Treat normal NYSE close as 16:00:00 ET; (holiday/early-close not handled)
+    return datetime.combine(d, time(16, 0, 0)).replace(tzinfo=EASTERN)
+
 def _normalize_tickers(raw: str) -> List[str]:
     seen, out = set(), []
     for t in raw.replace(",", " ").split():
@@ -89,7 +96,6 @@ def _normalize_tickers(raw: str) -> List[str]:
     return out
 
 def _is_clean_us_symbol(sym: str) -> bool:
-    # Allow up to 5 letters/digits (+ optional hyphen suffix). Skip obvious non-US/OTC prefixes.
     return bool(re.fullmatch(r"[A-Z0-9]{1,5}(-[A-Z0-9]{1,2})?", sym))
 
 def _chunks(lst, n):
@@ -111,18 +117,15 @@ def get_us_stock_universe() -> List[str]:
                     candidates.extend([str(t).strip().upper() for t in vals if t])
         except Exception:
             continue
-    # sanitize
     candidates = [t for t in dict.fromkeys(candidates) if _is_clean_us_symbol(t)]
     if not candidates:
         candidates = FALLBACK_LIQUID.copy()
-    # Always ensure FIXED_ETFS and a few known actives are present if the API misses them
     for t in list(ETF_SET) + ["OPEN"]:
         if t not in candidates and _is_clean_us_symbol(t):
             candidates.append(t)
     return list(dict.fromkeys(candidates))
 
 def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove today's partial bar until after ~4:05pm ET, so averages are comparable."""
     if df is None or df.empty:
         return df
     idx = df.index
@@ -185,45 +188,176 @@ def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     oc = yf.Ticker(ticker).option_chain(expiry)
     return oc.calls.copy(), oc.puts.copy()
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_next_earnings_date(ticker: str) -> Optional[date]:
-    today = _now_pacific_date()
-    tk = yf.Ticker(ticker)
+# =========================
+# Robust earnings fetch & window check (FIXED)
+# =========================
+def _as_et(dt: pd.Timestamp | datetime | str | date) -> Optional[datetime]:
+    """
+    Convert any yfinance-ish datetime to timezone-aware ET.
+    Accepts pandas Timestamp, datetime (aware or naive), string, or date.
+    """
     try:
-        df = tk.get_earnings_dates(limit=8)
+        if isinstance(dt, date) and not isinstance(dt, datetime):
+            # midnight naive local date -> assume UTC midnight then convert
+            dt = datetime(dt.year, dt.month, dt.day, tzinfo=UTC)
+        if isinstance(dt, str):
+            dt = pd.to_datetime(dt, utc=True, errors="coerce")
+        if isinstance(dt, pd.Timestamp):
+            if dt.tzinfo is None:
+                dt = dt.tz_localize(UTC)
+            else:
+                dt = dt.tz_convert(UTC)
+            return dt.tz_convert(EASTERN).to_pydatetime()
+        if isinstance(dt, datetime):
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            else:
+                dt = dt.astimezone(UTC)
+            return dt.astimezone(EASTERN)
+    except Exception:
+        return None
+    return None
+
+def _tod_label_from_et(dt_et: datetime) -> str:
+    # Coarse label; useful for display
+    h = dt_et.hour + dt_et.minute/60
+    if h < 9.5:
+        return "BMO"
+    if h < 16.0:
+        return "MID"
+    return "AMC"
+
+def _expand_if_time_unknown(d: date) -> List[datetime]:
+    """
+    Some sources only provide a date with no time. Expand to reasonable ET times:
+    - BMO proxy: 08:30 ET
+    - AMC proxy: 16:01 ET
+    We test both against the window.
+    """
+    return [
+        datetime.combine(d, time(8,30)).replace(tzinfo=EASTERN),
+        datetime.combine(d, time(16,1)).replace(tzinfo=EASTERN),
+    ]
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_earnings_events_et(ticker: str, limit: int = 12) -> List[Dict]:
+    """
+    Returns a list of candidate earnings events as ET-aware datetimes with source and certainty.
+    Each item: {"dt_et": datetime, "label": "BMO/AMC/MID/UNK", "source": "...", "certainty": "exact|proxy"}
+    """
+    tk = yf.Ticker(ticker)
+    events: List[Dict] = []
+
+    # Primary: get_earnings_dates (newer yfinance)
+    try:
+        df = tk.get_earnings_dates(limit=limit)
         if df is not None and not df.empty:
             col = "Earnings Date" if "Earnings Date" in df.columns else df.columns[0]
-            dates = pd.to_datetime(df[col], utc=True, errors="coerce").dt.date
-            fut = [d for d in dates if d and d >= today]
-            if fut:
-                return min(fut)
+            for val in df[col].tolist():
+                dt_et = _as_et(val)
+                if dt_et is not None:
+                    events.append({"dt_et": dt_et, "label": _tod_label_from_et(dt_et), "source": "get_earnings_dates", "certainty": "exact"})
+                else:
+                    # If it's a bare date, expand possibilities
+                    if isinstance(val, (pd.Timestamp, datetime)) and val.tzinfo is None:
+                        d = val.date()
+                        for proxy in _expand_if_time_unknown(d):
+                            events.append({"dt_et": proxy, "label": "UNK", "source": "get_earnings_dates", "certainty": "proxy"})
     except Exception:
         pass
-    for src in (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {})):
-        if src is None:
-            continue
+
+    # Fallback: calendar dict-like (often NaT or date only)
+    try:
+        cal = tk.calendar
+        # Some yfinance versions expose a DataFrame-like calendar
+        if hasattr(cal, "index") and "Earnings Date" in getattr(cal, "index", []):
+            val = cal.loc["Earnings Date"].values[0]
+            dt_et = _as_et(val)
+            if dt_et:
+                events.append({"dt_et": dt_et, "label": _tod_label_from_et(dt_et), "source": "calendar", "certainty": "exact"})
+            else:
+                # date-only → expand proxies
+                if isinstance(val, (pd.Timestamp, datetime)) and val.tzinfo is None:
+                    d = val.date()
+                    for proxy in _expand_if_time_unknown(d):
+                        events.append({"dt_et": proxy, "label": "UNK", "source": "calendar", "certainty": "proxy"})
+        elif isinstance(cal, dict) and "Earnings Date" in cal:
+            val = cal.get("Earnings Date")
+            dt_et = _as_et(val)
+            if dt_et:
+                events.append({"dt_et": dt_et, "label": _tod_label_from_et(dt_et), "source": "calendar", "certainty": "exact"})
+            elif isinstance(val, (pd.Timestamp, datetime)) and val.tzinfo is None:
+                d = val.date()
+                for proxy in _expand_if_time_unknown(d):
+                    events.append({"dt_et": proxy, "label": "UNK", "source": "calendar", "certainty": "proxy"})
+    except Exception:
+        pass
+
+    # Fallback: info/fast_info keys (rarely present)
+    for src_name, src in [("info", tk.info), ("fast_info", getattr(tk, "fast_info", {}))]:
         for key in ("Earnings Date", "earningsDate", "earnings_date", "nextEarningsDate"):
             try:
-                val = src[key] if isinstance(src, dict) else src.loc[key].values
+                val = src.get(key) if isinstance(src, dict) else None
+                if val is None:
+                    continue
                 if isinstance(val, (list, tuple, pd.Series, pd.Index)):
                     val = val[0]
-                d = pd.to_datetime(val, utc=True, errors="coerce")
-                if pd.notna(d) and d.date() >= today:
-                    return d.date()
+                dt_et = _as_et(val)
+                if dt_et:
+                    events.append({"dt_et": dt_et, "label": _tod_label_from_et(dt_et), "source": src_name, "certainty": "exact"})
+                elif isinstance(val, (pd.Timestamp, datetime)) and val.tzinfo is None:
+                    d = val.date()
+                    for proxy in _expand_if_time_unknown(d):
+                        events.append({"dt_et": proxy, "label": "UNK", "source": src_name, "certainty": "proxy"})
             except Exception:
                 continue
-    return None
+
+    # Deduplicate by datetime
+    if events:
+        # round seconds away to avoid tiny diffs
+        for e in events:
+            e["dt_et"] = e["dt_et"].replace(microsecond=0)
+        # unique by dt_et
+        unique = {}
+        for e in events:
+            unique.setdefault(e["dt_et"], e)
+        events = list(unique.values())
+        events.sort(key=lambda x: x["dt_et"])
+
+    return events
+
+def earnings_in_window_between(exp1: str, exp2: str, events_et: List[Dict]) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Determines if any earnings event falls in (exp1_close, exp2_close] in ET.
+    Returns (in_window, label_for_table, tag)
+      label_for_table example: "2025-10-28 AMC" or "2025-10-28 (?)"
+      tag: "earn" if true, else None
+    """
+    d1 = _expiry_to_date(exp1)
+    d2 = _expiry_to_date(exp2)
+    if not d1 or not d2:
+        return False, None, None
+    start = _market_close_et(d1)  # exclusive
+    end = _market_close_et(d2)    # inclusive
+
+    in_window = []
+    for e in events_et:
+        t: datetime = e["dt_et"]
+        if (t > start) and (t <= end):
+            # Accept exact and proxy, but annotate proxies
+            label = e["label"] if e["certainty"] == "exact" else "?"
+            in_window.append((t, label))
+
+    if not in_window:
+        return False, None, None
+
+    t, lbl = sorted(in_window, key=lambda x: x[0])[0]
+    return True, f"{t.date()} {lbl}", "earn"
 
 # =========================
 # 3M Avg Volume ranking — NO GATING
 # =========================
 def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
-    """
-    Download 3mo daily data for a batch of tickers and compute:
-      - avg_vol_3m (excluding today's partial bar)
-      - last_close (from the same dataset)
-    Returns rows only for tickers with valid volume history.
-    """
     if not tickers:
         return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close"])
     raw = _safe_multi_download(tickers, period="3mo", interval="1d")
@@ -245,7 +379,6 @@ def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
                 rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
             except Exception:
                 continue
-        # Per-ticker fallback for those yfinance skipped in the batch response
         missing = set(tickers) - set(got_syms)
         for t in list(missing):
             sub = _safe_single_download(t, period="3mo", interval="1d")
@@ -259,7 +392,6 @@ def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
             last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
             rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
     else:
-        # Degenerate single-frame: try each individually
         for t in tickers:
             sub = _safe_single_download(t, period="3mo", interval="1d")
             if sub is None or sub.empty or "Volume" not in sub.columns:
@@ -276,22 +408,13 @@ def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
-    """
-    Evaluate the ENTIRE US universe (NASDAQ + NYSE/AMEX) in 3M average volume
-    using batched downloads — no Stage-1 gating. Extras are always included.
-    """
     universe = get_us_stock_universe()
-
-    # Add user extras explicitly (and sanitize)
     extras = [e.strip().upper() for e in extras if _is_clean_us_symbol(e)]
     for e in extras:
         if e not in universe:
             universe.append(e)
-
-    # Remove fixed ETFs from the stock universe; they get appended later as ETFs
     stock_universe = [t for t in universe if t not in ETF_SET]
 
-    # Iterate ENTIRE universe in batches; build a big 3m stats table
     all_rows: List[pd.DataFrame] = []
     progress = st.progress(0.0, text="Computing 3M average volume across entire universe…")
     total = max(1, len(stock_universe))
@@ -308,22 +431,18 @@ def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close","source"])
 
     vol_df = pd.concat(all_rows, ignore_index=True).dropna(subset=["avg_vol_3m"])
-    # Guarantee extras are present even if yfinance missed a block (try single fetch)
     missing_extras = [e for e in extras if e not in vol_df["ticker"].unique().tolist()]
     if missing_extras:
         extra_fix = _batch_3mo_stats(missing_extras)
         if not extra_fix.empty:
             vol_df = pd.concat([vol_df, extra_fix], ignore_index=True)
 
-    # Rank by 3m average volume (descending)
     vol_df = vol_df.drop_duplicates(subset=["ticker"], keep="first")
     vol_df.sort_values("avg_vol_3m", ascending=False, inplace=True)
 
-    # Take top 27 stocks
     top_stocks = vol_df.head(TOP_STOCKS).copy()
     top_stocks["source"] = "Stock"
 
-    # Append ETFs (always include)
     etf_rows = []
     for etf in FIXED_ETFS:
         etf_df = _batch_3mo_stats([etf])
@@ -339,13 +458,15 @@ def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
 # =========================
 # IV/FF calculations
 # =========================
+@st.cache_data(ttl=900, show_spinner=False)
 def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     calls, puts = get_chain(ticker, expiry)
     if calls.empty and puts.empty:
         return None
-    strikes = pd.Index(sorted(set(calls["strike"]).union(set(puts["strike"])))).astype(float)
+    strikes = pd.Index(sorted(set(calls["strike"]).union(set(puts["strike"])))) if not (calls.empty and puts.empty) else pd.Index([])
     if len(strikes) == 0:
         return None
+    strikes = strikes.astype(float)
     atm = float(min(strikes, key=lambda s: abs(s - spot)))
     def iv_from(df: pd.DataFrame) -> Optional[float]:
         if df is None or df.empty:
@@ -400,6 +521,9 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
 # =========================
 # Screener
 # =========================
+def _nearest(ed, target):
+    return min(ed, key=lambda x: (abs(x[1] - target), x[1])) if ed else None
+
 @st.cache_data(ttl=900, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
     spot = get_spot(ticker)
@@ -413,25 +537,24 @@ def screen_ticker(ticker: str) -> List[Dict]:
                  "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
                  "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"]}]
     ed = [(e, _calc_dte(e)) for e in expiries]
-    nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
 
-    # Existing anchors
-    e30, e60, e90 = nearest(30), nearest(60), nearest(90)
-
-    # NEW: short-term anchors for 7–14 and 7–30
-    e7, e14 = nearest(7), nearest(14)
+    # Anchors (including short-term)
+    e7, e14, e30, e60, e90 = _nearest(ed, 7), _nearest(ed, 14), _nearest(ed, 30), _nearest(ed, 60), _nearest(ed, 90)
 
     pairs = []
-    # NEW pairs first (ensure increasing DTE order)
-    if e7 and e14 and e14[1] > e7[1]:   pairs.append(("7–14", e7, e14))
-    if e7 and e30 and e30[1] > e7[1]:   pairs.append(("7–30", e7, e30))
+    def add_pair(name, a, b):
+        if a and b and b[1] > a[1]:
+            pairs.append((name, a, b))
 
-    # Existing pairs
-    if e30 and e60 and e60[1] > e30[1]: pairs.append(("30–60", e30, e60))
-    if e30 and e90 and e90[1] > e30[1]: pairs.append(("30–90", e30, e90))
-    if e60 and e90 and e90[1] > e60[1]: pairs.append(("60–90", e60, e90))
+    add_pair("7–14", e7, e14)
+    add_pair("7–30", e7, e30)
+    add_pair("30–60", e30, e60)
+    add_pair("30–90", e30, e90)
+    add_pair("60–90", e60, e90)
 
-    earn_dt = get_next_earnings_date(ticker)
+    # Collect earnings events (ET)
+    events_et = get_earnings_events_et(ticker)
+
     rows = []
     for label, (exp1, dte1), (exp2, dte2) in pairs:
         iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
@@ -441,13 +564,14 @@ def screen_ticker(ticker: str) -> List[Dict]:
         T1, T2 = dte1/365.0, dte2/365.0
         fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
         _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
-        earn_txt, tags = "—", []
-        if earn_dt:
-            e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
-            if e1d and e2d and min(e1d, e2d) <= earn_dt <= max(e1d, e2d):
-                earn_txt, tags = earn_dt.strftime("%Y-%m-%d"), ["earn"]
+
+        earn_flag, earn_label, earn_tag = earnings_in_window_between(exp1, exp2, events_et)
+        tags = []
+        if earn_flag:
+            tags.append(earn_tag)
         if ff is not None and ff >= 0.20:
             tags.append("hot")
+
         rows.append({
             "ticker": ticker, "pair": label,
             "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%",
@@ -455,7 +579,7 @@ def screen_ticker(ticker: str) -> List[Dict]:
             "fwd_vol": f"{(fwd_sigma*100):.2f}%" if fwd_sigma is not None else "—",
             "ff": f"{(ff*100):.2f}%" if ff is not None else "—",
             "cal_debit": f"{debit:.2f}" if debit is not None else "—",
-            "earn_in_window": earn_txt,
+            "earn_in_window": earn_label if earn_label else "—",
             "_tags": tags,
         })
     return rows
@@ -604,16 +728,13 @@ if st.session_state.trigger_run:
 if st.session_state.vol_topN is not None and not st.session_state.vol_topN.empty:
     st.subheader(f"Selected Tickers (Top {TOP_STOCKS} Stocks by 3M Avg Vol + ETFs)")
     base = st.session_state.vol_topN.copy()
-    source_order = pd.api.types.CategoricalDtype(categories=["Stock", "ETF"], ordered=True)
-    base["Source"] = base["source"].astype(source_order)
-    base["SourceOrder"] = base["Source"].cat.codes
     base["AvgVolNum"] = pd.to_numeric(base["avg_vol_3m"], errors="coerce")
-    base = base.sort_values(by=["SourceOrder", "AvgVolNum"], ascending=[True, False], kind="mergesort")
+    base = base.sort_values(by=["source", "AvgVolNum"], ascending=[True, False], kind="mergesort")
     disp = pd.DataFrame({
         "Ticker": base["ticker"],
         "Avg Vol (3m)": base["AvgVolNum"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "—"),
         "Last Close": base["last_close"].apply(lambda v: f"${v:,.2f}" if pd.notna(v) else "—"),
-        "Source": base["Source"].astype(str),
+        "Source": base["source"].astype(str),
     })
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
@@ -669,7 +790,7 @@ else:
     """, unsafe_allow_html=True)
 
     st.markdown(styled.to_html(), unsafe_allow_html=True)
-    st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
+    st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window (incl. uncertain time) 🟧 Both conditions true")
 
 st.markdown(
     "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
