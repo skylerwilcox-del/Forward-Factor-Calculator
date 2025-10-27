@@ -280,7 +280,7 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
     return fwd_sigma, ff
 
 # =========================
-# Screener (with earnings gating per strategy)
+# Screener (earnings gating & visibility)
 # =========================
 @st.cache_data(ttl=900, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
@@ -301,7 +301,7 @@ def screen_ticker(ticker: str) -> List[Dict]:
     ed = [(e, _calc_dte(e)) for e in expiries]
     nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
 
-    # Anchor expiries
+    # Anchors
     e7, e14 = nearest(7), nearest(14)
     e30, e60, e90 = nearest(30), nearest(60), nearest(90)
 
@@ -318,25 +318,26 @@ def screen_ticker(ticker: str) -> List[Dict]:
     rows = []
 
     for label, (exp1, dte1), (exp2, dte2) in pairs:
-        # Earnings gating per your rules:
-        # 1) earnings before exp1 -> BLOCK (skip pair)
-        # 2) earnings between [exp1, exp2] -> ALLOW + FLAG + show earnings date
-        # 3) earnings after exp2 or None -> ALLOW (no flag, no date shown)
+        # Determine earnings relationship against the pair window
         earn_txt = "—"
         tags: List[str] = []
+        e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
 
         if earn_dt:
-            e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
+            earn_txt = earn_dt.strftime("%Y-%m-%d")
             if e1d and earn_dt < e1d:
-                # BLOCK: do not include this pair
-                continue
-            if e1d and e2d and e1d <= earn_dt <= e2d:
-                earn_txt = earn_dt.strftime("%Y-%m-%d")
-                tags.append("earn")  # flagged but allowed
+                # BLOCKED by strategy, but KEEP visible and mark red
+                tags.append("blocked")
+            elif e1d and e2d and e1d <= earn_dt <= e2d:
+                # Allowed but flagged
+                tags.append("earn")
+            else:
+                # After Exp2: allowed, shown but not flagged (no special tag needed)
+                pass
 
+        # Compute IVs; if missing, skip to avoid blank rows
         iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
         if iv1 is None or iv2 is None:
-            # Skip incomplete IV data to avoid blank rows
             continue
 
         s1, s2 = iv1/100.0, iv2/100.0
@@ -669,15 +670,20 @@ else:
 
     def _highlight_row(row: pd.Series):
         tags = tags_series.iloc[row.name] if row.name in tags_series.index else []
+        blocked = isinstance(tags, (list, tuple, set)) and ("blocked" in tags)
         earn = isinstance(tags, (list, tuple, set)) and ("earn" in tags)
         hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
-        color = "#ffffff"
-        if earn and hot:
+        # Priority: blocked (red) > both (orange) > earn (yellow) > hot (green)
+        if blocked:
+            color = "#ffcdd2"  # red-ish for blocked
+        elif earn and hot:
             color = "#ffe0b2"  # both
         elif earn:
             color = "#fff9c4"  # earnings in window
         elif hot:
             color = "#dcedc8"  # FF >= 0.20
+        else:
+            color = "#ffffff"
         return [f"background-color:{color}; color:#000000;"] * len(row)
 
     styled = (df_display.style
@@ -694,7 +700,7 @@ else:
     """, unsafe_allow_html=True)
 
     st.markdown(styled.to_html(), unsafe_allow_html=True)
-    st.caption("🟩 FF ≥ 0.20 🟨 Earnings in window 🟧 Both conditions true")
+    st.caption("🟥 Blocked (earnings before Exp 1) 🟨 Earnings in window 🟩 FF ≥ 0.20 🟧 Earnings+Hot")
 
 st.markdown(
     "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
