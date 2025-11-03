@@ -3,6 +3,7 @@ import time
 from datetime import datetime, date
 from typing import Optional, Tuple, List, Dict
 import re
+import os
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =========================
 PACIFIC = pytz.timezone("America/Los_Angeles")
 EASTERN = pytz.timezone("America/New_York")
-st.set_page_config(page_title="Forward Vol Screener — Top 27 (3M Avg Vol, All US Stocks)", layout="wide")
+st.set_page_config(page_title="Forward Vol Screener (Debug Safe Mode Enabled)", layout="wide")
 
 # Persistent session state
 st.session_state.setdefault("df", None)
@@ -29,10 +30,15 @@ st.session_state.setdefault("first_visit", True)
 TOP_STOCKS = 27
 FIXED_ETFS = ["SPY", "QQQ", "VOO"]
 ETF_SET = set(FIXED_ETFS)
+EM_DASH = "—"
+BLANKS = {"", "-", "—", "–", "---"}
 
-# Download tuning (slightly conservative to reduce throttling)
+# Download tuning (conservative to reduce throttling)
 BATCH_3MO = 20
 MAX_WORKERS = 5
+
+# Known-good tickers for debug
+DEBUG_TICKERS = ["AAPL", "MSFT", "NVDA", "SPY"]
 
 # Large liquid fallback universe
 FALLBACK_LIQUID = [
@@ -40,12 +46,9 @@ FALLBACK_LIQUID = [
     "UBER","QCOM","AMAT","TSM","ORCL","PFE","MRK","JNJ","LLY","V","MA","JPM","BAC","WFC","C","GS","MS","SCHW","BLK",
     "GE","HON","CAT","BA","NKE","KO","PG","MCD","WMT","HD","LOW","TGT","DIS","CMCSA","T","VZ","TMUS","CSCO",
     "PANW","NOW","SNOW","DDOG","NET","MDB","ZS","PLTR","SHOP","ABNB","PYPL","SQ","ROKU","TTD","SPOT","DKNG","RBLX",
-    "MU","NXPI","TXN","ADI","ON","LRCX","KLAC","ASML","BABA","BIDU","PDD","RIO","BHP","CVX","XOM","COP","OXY","SLB",
-    "F","GM","RIVN","LCID","NIO","CCL","AAL","UAL","DAL","UPS","FDX","SOFI","COIN","HOOD","GME","OPEN"
+    "MU","NXPI","TXN","ADI","ON","LRCX","KLAC","ASML","CVX","XOM","COP","OXY","SLB",
+    "F","GM","AAL","UAL","DAL","UPS","FDX","SOFI","COIN","HOOD","GME","OPEN"
 ]
-
-EM_DASH = "—"
-BLANKS = {"", "-", "—", "–", "---"}
 
 # =========================
 # Helpers
@@ -61,8 +64,11 @@ def _first_float(val) -> Optional[float]:
         return None
 
 def _calc_dte(expiry_iso: str) -> int:
-    y, m, d = map(int, expiry_iso.split("-"))
-    return max((date(y, m, d) - _now_pacific_date()).days, 0)
+    try:
+        y, m, d = map(int, expiry_iso.split("-"))
+        return max((date(y, m, d) - _now_pacific_date()).days, 0)
+    except Exception:
+        return 0
 
 def _expiry_to_date(expiry_iso: str) -> Optional[date]:
     try:
@@ -95,12 +101,16 @@ def _fmt_money(x: Optional[float]) -> str:
 def _dash_if_none(x):
     return EM_DASH if x is None else x
 
+def _log(msg: str):
+    st.session_state.setdefault("_debug_logs", [])
+    st.session_state["_debug_logs"].append(msg)
+
 # Simple retry decorator
 def _retry(n=3, wait=0.5):
     def deco(fn):
         def wrap(*a, **k):
             last = None
-            for _ in range(n):
+            for i in range(n):
                 try:
                     return fn(*a, **k)
                 except Exception as e:
@@ -113,25 +123,10 @@ def _retry(n=3, wait=0.5):
 # =========================
 # yfinance (cached + hardened)
 # =========================
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_us_stock_universe() -> List[str]:
-    candidates: List[str] = []
-    for fn_name in ["tickers_nasdaq", "tickers_other", "tickers_sp500"]:
-        try:
-            fn = getattr(yf, fn_name, None)
-            if callable(fn):
-                vals = fn()
-                if isinstance(vals, (list, tuple)):
-                    candidates.extend([str(t).strip().upper() for t in vals if t])
-        except Exception:
-            continue
-    candidates = [t for t in dict.fromkeys(candidates) if _is_clean_us_symbol(t)]
-    if not candidates:
-        candidates = FALLBACK_LIQUID.copy()
-    for t in list(ETF_SET) + ["OPEN"]:
-        if t not in candidates and _is_clean_us_symbol(t):
-            candidates.append(t)
-    return list(dict.fromkeys(candidates))
+    # Use only fallback for now (minimize external surface while debugging)
+    return list(dict.fromkeys(FALLBACK_LIQUID + FIXED_ETFS + ["OPEN"]))
 
 def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -149,7 +144,7 @@ def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
         dfc = dfc[dfc["et_date"] < today_et]
     return dfc.drop(columns=["et_date"])
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def _safe_multi_download(tickers, period, interval):
     if not tickers:
         return pd.DataFrame()
@@ -158,20 +153,21 @@ def _safe_multi_download(tickers, period, interval):
             tickers=tickers, period=period, interval=interval,
             auto_adjust=False, group_by="ticker", threads=True, progress=False
         )
-    except Exception:
+    except Exception as e:
+        _log(f"yf.download multi failed: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def _safe_single_download(ticker, period, interval):
     try:
         return yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
-    except Exception:
+    except Exception as e:
+        _log(f"yf.download single failed {ticker}: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 @_retry(n=3, wait=0.6)
 def get_spot(ticker: str) -> Optional[float]:
-    """Robust spot getter: fast_info -> info -> 1d -> 5d -> 1m last"""
     tk = yf.Ticker(ticker)
     # 1) fast_info
     try:
@@ -179,17 +175,17 @@ def get_spot(ticker: str) -> Optional[float]:
         v = fi.get("last_price") or fi.get("last_price_raw") or fi.get("regular_market_price")
         v = _first_float(v)
         if v is not None: return v
-    except Exception:
-        pass
+    except Exception as e:
+        _log(f"{ticker} fast_info err: {e}")
     # 2) info
     try:
         inf = getattr(tk, "info", {}) or {}
         v = inf.get("regularMarketPrice") or inf.get("currentPrice")
         v = _first_float(v)
         if v is not None: return v
-    except Exception:
-        pass
-    # 3) history daily
+    except Exception as e:
+        _log(f"{ticker} info err: {e}")
+    # 3) history fallbacks
     for per, intrv in [("1d","1m"), ("5d","1d")]:
         try:
             px = tk.history(period=per, interval=intrv, auto_adjust=False)
@@ -198,44 +194,47 @@ def get_spot(ticker: str) -> Optional[float]:
                     return float(px["Close"].dropna().iloc[-1])
                 if "close" in px.columns and not px["close"].dropna().empty:
                     return float(px["close"].dropna().iloc[-1])
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"{ticker} hist {per}/{intrv} err: {e}")
     return None
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 @_retry(n=3, wait=0.6)
 def get_options(ticker: str) -> List[str]:
     opts = []
     tk = yf.Ticker(ticker)
     try:
         opts = tk.options or []
-    except Exception:
-        pass
+    except Exception as e:
+        _log(f"{ticker} options err: {e}")
     # Validate yyyy-mm-dd strings only
-    return [e for e in opts if isinstance(e, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", e)]
+    exp = [e for e in opts if isinstance(e, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", e)]
+    if not exp:
+        _log(f"{ticker} no expiries")
+    return exp
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=480, show_spinner=False)
 @_retry(n=3, wait=0.7)
 def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    oc = yf.Ticker(ticker).option_chain(expiry)
-    calls = oc.calls.copy() if hasattr(oc, "calls") else pd.DataFrame()
-    puts  = oc.puts.copy()  if hasattr(oc, "puts")  else pd.DataFrame()
-    # Normalize column names
+    try:
+        oc = yf.Ticker(ticker).option_chain(expiry)
+        calls = oc.calls.copy() if hasattr(oc, "calls") else pd.DataFrame()
+        puts  = oc.puts.copy()  if hasattr(oc, "puts")  else pd.DataFrame()
+    except Exception as e:
+        _log(f"{ticker} chain {expiry} err: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+    # Normalize column names we rely on
     for df in (calls, puts):
         if not df.empty:
-            cols = {c.lower(): c for c in df.columns}
-            # ensure lastPrice / impliedVolatility exist
-            if "lastprice" in cols and "lastPrice" not in df.columns:
-                df.rename(columns={"lastprice":"lastPrice"}, inplace=True)
-            if "last_price" in df.columns and "lastPrice" not in df.columns:
+            if "lastPrice" not in df.columns and "last_price" in df.columns:
                 df.rename(columns={"last_price":"lastPrice"}, inplace=True)
-            if "impliedvolatility" in cols and "impliedVolatility" not in df.columns:
-                df.rename(columns={"impliedvolatility":"impliedVolatility"}, inplace=True)
-            if "implied_volatility" in df.columns and "impliedVolatility" not in df.columns:
+            if "impliedVolatility" not in df.columns and "implied_volatility" in df.columns:
                 df.rename(columns={"implied_volatility":"impliedVolatility"}, inplace=True)
+    if calls.empty and puts.empty:
+        _log(f"{ticker} chain empty for {expiry}")
     return calls, puts
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_next_earnings_date(ticker: str) -> Optional[date]:
     today = _now_pacific_date()
     tk = yf.Ticker(ticker)
@@ -248,8 +247,8 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
             fut = [d for d in dates if d and d >= today]
             if fut:
                 return min(fut)
-    except Exception:
-        pass
+    except Exception as e:
+        _log(f"{ticker} get_earnings_dates err: {e}")
     # Fallback: calendar/info
     try_sources = (getattr(tk, "calendar", None), getattr(tk, "info", {}), getattr(tk, "fast_info", {}))
     for src in try_sources:
@@ -268,7 +267,7 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
     return None
 
 # =========================
-# IV/FF calculations (tolerant)
+# IV/FF calculations
 # =========================
 def _nearest_strike(series: pd.Series, target: float) -> Optional[float]:
     s = pd.to_numeric(series, errors="coerce").dropna().astype(float)
@@ -291,10 +290,9 @@ def _iv_from_df_at_strike(df: pd.DataFrame, strike: float) -> Optional[float]:
     if df is None or df.empty:
         return None
     strikes = pd.to_numeric(df["strike"], errors="coerce")
-    # Tolerant match
+    # tolerant match
     idx = np.where(np.isclose(strikes, strike, rtol=0, atol=max(0.01, 0.002*max(1.0, strike))))[0]
     if len(idx) == 0:
-        # Fall back to nearest row
         nearest = _nearest_strike(df["strike"], strike)
         if nearest is None:
             return None
@@ -305,24 +303,23 @@ def _iv_from_df_at_strike(df: pd.DataFrame, strike: float) -> Optional[float]:
     iv = _first_float(row.get("impliedVolatility"))
     if iv is None:
         return None
-    # yfinance IV is 0-1; convert to %
     return float(iv)*100.0 if iv <= 1.5 else float(iv)
 
 def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     calls, puts = get_chain(ticker, expiry)
-    # Use nearest strike from union of call/put strikes
     strikes = []
     for df in (calls, puts):
         if df is not None and not df.empty and "strike" in df.columns:
             strikes.extend(pd.to_numeric(df["strike"], errors="coerce").dropna().astype(float).tolist())
     if not strikes:
+        _log(f"{ticker} no strikes for {expiry}")
         return None
     atm = min(strikes, key=lambda s: abs(s - spot))
     c_iv = _iv_from_df_at_strike(calls, atm)
     p_iv = _iv_from_df_at_strike(puts, atm)
-    if c_iv is not None and p_iv is not None:
-        return 0.5*(c_iv+p_iv)
-    return c_iv if c_iv is not None else p_iv
+    if c_iv is None and p_iv is None:
+        _log(f"{ticker} no IV at ATM for {expiry}")
+    return (0.5*(c_iv+p_iv) if (c_iv is not None and p_iv is not None) else (c_iv if c_iv is not None else p_iv))
 
 def _strikes_from_chain(df: pd.DataFrame) -> set:
     if df is None or df.empty or "strike" not in df.columns:
@@ -337,13 +334,13 @@ def common_atm_strike(ticker: str, exp1: str, exp2: str, spot: float) -> Optiona
     s2 = _strikes_from_chain(c2) | _strikes_from_chain(p2)
     inter = s1 & s2
     if not inter:
-        # Tolerant: pick nearest strike in s1 and then snap to nearest in s2
         if not s1 or not s2:
+            _log(f"{ticker} no intersect strikes {exp1}/{exp2}")
             return None
         a = min(s1, key=lambda s: abs(s-spot))
         b = min(s2, key=lambda s: abs(s-spot))
-        # if still far, give up
         if abs(a-b) > max(0.1, 0.003*spot):
+            _log(f"{ticker} ATM mismatch {exp1}/{exp2}")
             return None
         return float(0.5*(a+b))
     return float(min(inter, key=lambda s: abs(s - spot)))
@@ -380,7 +377,7 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
     return fwd_sigma, ff
 
 # =========================
-# Screener (earnings gating & visibility)
+# Screener core
 # =========================
 def _expiry_dtes(expiries: List[str]) -> List[Tuple[str, int]]:
     out = []
@@ -400,25 +397,27 @@ def _pick_next(ed: List[Tuple[str, int]], target_dte: int) -> Optional[Tuple[str
             return e
     return ed[-1]
 
-@st.cache_data(ttl=600, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
     rows: List[Dict] = []
 
     spot = get_spot(ticker)
-    if spot is None:
-        rows.append({
-            "ticker": ticker, "pair": EM_DASH, "exp1": EM_DASH, "dte1": EM_DASH, "iv1": EM_DASH,
-            "exp2": EM_DASH, "dte2": EM_DASH, "iv2": EM_DASH, "fwd_vol": EM_DASH, "ff": EM_DASH,
-            "cal_debit": EM_DASH, "earn_in_window": EM_DASH, "_tags": ["no_spot"], "reason": "no_spot"
-        })
-        return rows
-
     expiries = get_options(ticker)
-    if not expiries:
+
+    # DEBUG surface
+    st.session_state.setdefault("_diag_rows", [])
+    st.session_state["_diag_rows"].append({
+        "Ticker": ticker,
+        "Spot?": spot is not None,
+        "Exp count": len(expiries or []),
+        "First 3 exp": ", ".join(expiries[:3]) if expiries else "",
+    })
+
+    if spot is None or not expiries:
         rows.append({
             "ticker": ticker, "pair": EM_DASH, "exp1": EM_DASH, "dte1": EM_DASH, "iv1": EM_DASH,
             "exp2": EM_DASH, "dte2": EM_DASH, "iv2": EM_DASH, "fwd_vol": EM_DASH, "ff": EM_DASH,
-            "cal_debit": EM_DASH, "earn_in_window": EM_DASH, "_tags": ["no_exp"], "reason": "no_exp"
+            "cal_debit": EM_DASH, "earn_in_window": EM_DASH,
+            "_tags": [("no_spot" if spot is None else "no_exp")], "reason": ("no_spot" if spot is None else "no_exp")
         })
         return rows
 
@@ -467,6 +466,13 @@ def screen_ticker(ticker: str) -> List[Dict]:
         iv1 = atm_iv(ticker, exp1, spot)
         iv2 = atm_iv(ticker, exp2, spot)
 
+        # add diag line for IV reachability
+        st.session_state.setdefault("_diag_iv", [])
+        st.session_state["_diag_iv"].append({
+            "Ticker": ticker, "Pair": label,
+            "IV1?": iv1 is not None, "IV2?": iv2 is not None, "exp1": exp1, "exp2": exp2
+        })
+
         fwd_txt, ff_txt = EM_DASH, EM_DASH
         reason = "ok"
 
@@ -513,19 +519,145 @@ def scan_many(tickers: List[str]) -> pd.DataFrame:
             try:
                 rows.extend(fut.result())
             except Exception as e:
+                _log(f"scan error {t}: {e}")
                 rows.append({"ticker": t, "pair": EM_DASH,"exp1": EM_DASH,"dte1": EM_DASH,"iv1": EM_DASH,
                              "exp2": EM_DASH,"dte2": EM_DASH,"iv2": EM_DASH,"fwd_vol": EM_DASH,"ff": EM_DASH,
                              "cal_debit": EM_DASH,"earn_in_window": EM_DASH,"_tags": [f"error:{type(e).__name__}"], "reason": "error"})
             done += 1
             progress.progress(done / len(tickers), text=f"Scanned {t} ({done}/{len(tickers)})")
-            time.sleep(0.10)
+            time.sleep(0.08)
     progress.empty()
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
-    if "_tags" not in df.columns:
+        _log("scan_many produced empty df")
+    if "_tags" not in df.columns and not df.empty:
         df["_tags"] = [[] for _ in range(len(df))]
     return df
+
+# =========================
+# Volume ranking (kept simple in safe mode)
+# =========================
+@st.cache_data(ttl=600, show_spinner=False)
+def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close"])
+    raw = _safe_multi_download(tickers, period="3mo", interval="1d")
+    rows = []
+
+    if isinstance(getattr(raw, "columns", None), pd.MultiIndex):
+        got_syms = [c[0] for c in raw.columns.unique(level=0)]
+        for t in got_syms:
+            try:
+                sub = raw[t]
+                sub = _exclude_today_if_open(sub)
+                if sub is None or sub.empty or "Volume" not in sub.columns:
+                    continue
+                vols = sub["Volume"].dropna()
+                if vols.empty:
+                    continue
+                avgv = float(vols.mean())
+                last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+                rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
+            except Exception as e:
+                _log(f"vol stats err {t}: {e}")
+                continue
+        missing = set(tickers) - set(got_syms)
+        for t in list(missing):
+            sub = _safe_single_download(t, period="3mo", interval="1d")
+            if sub is None or sub.empty or "Volume" not in sub.columns:
+                continue
+            sub = _exclude_today_if_open(sub)
+            vols = sub["Volume"].dropna()
+            if vols.empty:
+                continue
+            avgv = float(vols.mean())
+            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+            rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
+    else:
+        for t in tickers:
+            sub = _safe_single_download(t, period="3mo", interval="1d")
+            if sub is None or sub.empty or "Volume" not in sub.columns:
+                continue
+            sub = _exclude_today_if_open(sub)
+            vols = sub["Volume"].dropna()
+            if vols.empty:
+                continue
+            avgv = float(vols.mean())
+            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
+            rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
+
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def rank_top27_by_3m_avg_with_etfs(extras: List[str], debug_mode: bool) -> pd.DataFrame:
+    if debug_mode:
+        # In safe mode, do not scan the universe — just return the debug tickers and ETFs
+        rows = []
+        # Attach minimal stats for display
+        stats = _batch_3mo_stats(DEBUG_TICKERS + FIXED_ETFS)
+        for t in DEBUG_TICKERS:
+            r = stats.loc[stats["ticker"]==t]
+            if not r.empty:
+                rr = r.iloc[0]
+                rows.append({"ticker": t, "avg_vol_3m": rr["avg_vol_3m"], "last_close": rr["last_close"], "source": "Stock"})
+            else:
+                rows.append({"ticker": t, "avg_vol_3m": None, "last_close": None, "source": "Stock"})
+        for etf in FIXED_ETFS:
+            r = stats.loc[stats["ticker"]==etf]
+            if not r.empty:
+                rr = r.iloc[0]
+                rows.append({"ticker": etf, "avg_vol_3m": rr["avg_vol_3m"], "last_close": rr["last_close"], "source": "ETF"})
+            else:
+                rows.append({"ticker": etf, "avg_vol_3m": None, "last_close": None, "source": "ETF"})
+        return pd.DataFrame(rows)
+
+    universe = get_us_stock_universe()
+    extras = [e.strip().upper() for e in extras if _is_clean_us_symbol(e)]
+    for e in extras:
+        if e not in universe:
+            universe.append(e)
+    stock_universe = [t for t in universe if t not in ETF_SET]
+    all_rows: List[pd.DataFrame] = []
+    progress = st.progress(0.0, text="Computing 3M average volume across universe…")
+    total = max(1, len(stock_universe))
+    processed = 0
+    for block in _chunks(stock_universe, BATCH_3MO):
+        dfb = _batch_3mo_stats(block)
+        if not dfb.empty:
+            all_rows.append(dfb)
+        processed += len(block)
+        progress.progress(min(1.0, processed/total), text=f"3M avg vol calc: {processed}/{total} symbols")
+    progress.empty()
+
+    if not all_rows:
+        return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close","source"])
+
+    vol_df = pd.concat(all_rows, ignore_index=True).dropna(subset=["avg_vol_3m"])
+
+    # Ensure extras are present
+    missing_extras = [e for e in extras if e not in vol_df["ticker"].unique().tolist()]
+    if missing_extras:
+        extra_fix = _batch_3mo_stats(missing_extras)
+        if not extra_fix.empty:
+            vol_df = pd.concat([vol_df, extra_fix], ignore_index=True)
+
+    vol_df = vol_df.drop_duplicates(subset=["ticker"], keep="first")
+    vol_df.sort_values("avg_vol_3m", ascending=False, inplace=True)
+
+    top_stocks = vol_df.head(TOP_STOCKS).copy()
+    top_stocks["source"] = "Stock"
+
+    etf_rows = []
+    for etf in FIXED_ETFS:
+        etf_df = _batch_3mo_stats([etf])
+        if not etf_df.empty:
+            row = etf_df.iloc[0]
+            etf_rows.append({"ticker": etf, "avg_vol_3m": float(row["avg_vol_3m"]), "last_close": row["last_close"], "source": "ETF"})
+        else:
+            etf_rows.append({"ticker": etf, "avg_vol_3m": None, "last_close": None, "source": "ETF"})
+
+    full_final = pd.concat([top_stocks, pd.DataFrame(etf_rows)], ignore_index=True).reset_index(drop=True)
+    return full_final
 
 # =========================
 # Sorting helpers
@@ -585,108 +717,6 @@ def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
               .reset_index(drop=True))
 
 # =========================
-# 3M Avg Volume ranking — NO GATING
-# =========================
-@st.cache_data(ttl=900, show_spinner=False)
-def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
-    if not tickers:
-        return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close"])
-    raw = _safe_multi_download(tickers, period="3mo", interval="1d")
-    rows = []
-
-    if isinstance(getattr(raw, "columns", None), pd.MultiIndex):
-        got_syms = [c[0] for c in raw.columns.unique(level=0)]
-        for t in got_syms:
-            try:
-                sub = raw[t]
-                sub = _exclude_today_if_open(sub)
-                if sub is None or sub.empty or "Volume" not in sub.columns:
-                    continue
-                vols = sub["Volume"].dropna()
-                if vols.empty:
-                    continue
-                avgv = float(vols.mean())
-                last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
-                rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
-            except Exception:
-                continue
-        missing = set(tickers) - set(got_syms)
-        for t in list(missing):
-            sub = _safe_single_download(t, period="3mo", interval="1d")
-            if sub is None or sub.empty or "Volume" not in sub.columns:
-                continue
-            sub = _exclude_today_if_open(sub)
-            vols = sub["Volume"].dropna()
-            if vols.empty:
-                continue
-            avgv = float(vols.mean())
-            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
-            rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
-    else:
-        for t in tickers:
-            sub = _safe_single_download(t, period="3mo", interval="1d")
-            if sub is None or sub.empty or "Volume" not in sub.columns:
-                continue
-            sub = _exclude_today_if_open(sub)
-            vols = sub["Volume"].dropna()
-            if vols.empty:
-                continue
-            avgv = float(vols.mean())
-            last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
-            rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
-
-    return pd.DataFrame(rows)
-
-@st.cache_data(ttl=900, show_spinner=False)
-def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
-    universe = get_us_stock_universe()
-    extras = [e.strip().upper() for e in extras if _is_clean_us_symbol(e)]
-    for e in extras:
-        if e not in universe:
-            universe.append(e)
-    stock_universe = [t for t in universe if t not in ETF_SET]
-    all_rows: List[pd.DataFrame] = []
-    progress = st.progress(0.0, text="Computing 3M average volume across entire universe…")
-    total = max(1, len(stock_universe))
-    processed = 0
-    for block in _chunks(stock_universe, BATCH_3MO):
-        dfb = _batch_3mo_stats(block)
-        if not dfb.empty:
-            all_rows.append(dfb)
-        processed += len(block)
-        progress.progress(min(1.0, processed/total), text=f"3M avg vol calc: {processed}/{total} symbols")
-    progress.empty()
-
-    if not all_rows:
-        return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close","source"])
-
-    vol_df = pd.concat(all_rows, ignore_index=True).dropna(subset=["avg_vol_3m"])
-    # Ensure extras are present
-    missing_extras = [e for e in extras if e not in vol_df["ticker"].unique().tolist()]
-    if missing_extras:
-        extra_fix = _batch_3mo_stats(missing_extras)
-        if not extra_fix.empty:
-            vol_df = pd.concat([vol_df, extra_fix], ignore_index=True)
-
-    vol_df = vol_df.drop_duplicates(subset=["ticker"], keep="first")
-    vol_df.sort_values("avg_vol_3m", ascending=False, inplace=True)
-
-    top_stocks = vol_df.head(TOP_STOCKS).copy()
-    top_stocks["source"] = "Stock"
-
-    etf_rows = []
-    for etf in FIXED_ETFS:
-        etf_df = _batch_3mo_stats([etf])
-        if not etf_df.empty:
-            row = etf_df.iloc[0]
-            etf_rows.append({"ticker": etf, "avg_vol_3m": float(row["avg_vol_3m"]), "last_close": row["last_close"], "source": "ETF"})
-        else:
-            etf_rows.append({"ticker": etf, "avg_vol_3m": None, "last_close": None, "source": "ETF"})
-
-    full_final = pd.concat([top_stocks, pd.DataFrame(etf_rows)], ignore_index=True).reset_index(drop=True)
-    return full_final
-
-# =========================
 # UI
 # =========================
 DISPLAY_MAP = {
@@ -706,22 +736,26 @@ DISPLAY_MAP = {
 LABEL_TO_KEY = {v: k for k, v in DISPLAY_MAP.items()}
 DISPLAY_KEYS = ["ticker","pair","exp1","dte1","iv1","exp2","dte2","iv2","fwd_vol","ff","cal_debit","earn_in_window"]
 
-st.title("📈 Forward Volatility Screener (Top 27 by 3M Avg Volume — All US Stocks)")
-st.markdown(
-    "Evaluates **all NASDAQ + NYSE/AMEX** stocks by **average daily volume over the last 3 months** (no early gating), "
-    f"selects **Top {TOP_STOCKS} stocks**, then adds **SPY, QQQ, VOO**."
-)
+st.title("📈 Forward Volatility Screener — Safe Mode")
+st.caption("If your normal scan renders blank, turn on Safe Mode to test with known-good tickers and show live diagnostics.")
 
-raw_extra = st.text_input("Optional: Add tickers (comma/space separated)", "", placeholder="e.g., NVDA, TSLA, OPEN, META")
+col_top = st.columns([1,1,2])
+with col_top[0]:
+    debug_mode = st.toggle("Safe Mode (Debug)", value=True, help="Scan AAPL/MSFT/NVDA/SPY only and show diagnostics.")
+with col_top[1]:
+    clear_cache = st.button("Clear Cache", help="Force-refresh all cached data functions.")
+with col_top[2]:
+    raw_extra = st.text_input("Optional: Add tickers (comma/space separated)", "", placeholder="e.g., NVDA, TSLA, OPEN, META")
+
+if clear_cache:
+    # Bust all caches so we don't keep empty results
+    st.cache_data.clear()
+    st.success("Cleared cache. Re-run your scan.")
 
 def trigger_run():
     st.session_state.trigger_run = True
 
-colA, colB = st.columns([1, 3])
-with colA:
-    st.button("Build List & Run", type="primary", help="Rank by 3M avg volume, then scan options", on_click=trigger_run)
-with colB:
-    st.caption("Excludes today's partial volume until after ~4:05pm ET close.")
+st.button("Build List & Run", type="primary", help="Rank list (or use Safe Mode list) and scan options", on_click=trigger_run)
 
 # Auto-run once on first visit
 if st.session_state.first_visit and not st.session_state.trigger_run:
@@ -732,45 +766,45 @@ if st.session_state.first_visit and not st.session_state.trigger_run:
 if st.session_state.trigger_run:
     extras = _normalize_tickers(raw_extra)
 
-    with st.spinner("Building ranked list (3M avg volume across entire universe)…"):
-        vol_top_df = rank_top27_by_3m_avg_with_etfs(extras=extras)
+    with st.spinner("Preparing ticker list…"):
+        vol_top_df = rank_top27_by_3m_avg_with_etfs(extras=extras, debug_mode=debug_mode)
 
     st.session_state.vol_topN = vol_top_df
-    st.session_state.tickers = vol_top_df["ticker"].tolist() if not vol_top_df.empty else []
+    st.session_state.tickers = vol_top_df["ticker"].tolist() if not vol_top_df.empty else (DEBUG_TICKERS if debug_mode else [])
 
     if st.session_state.tickers:
         with st.spinner("Scanning option chains…"):
+            # reset diagnostics each run
+            st.session_state["_debug_logs"] = []
+            st.session_state["_diag_rows"] = []
+            st.session_state["_diag_iv"] = []
             st.session_state.df = scan_many(st.session_state.tickers)
         st.success("✅ Scan complete! Results displayed below.")
     else:
         st.session_state.df = pd.DataFrame()
-        st.warning("No tickers selected by the ranking step.")
+        st.error("No tickers to scan. If not in Safe Mode, your 3M-volume ranking may have returned empty. Toggle Safe Mode.")
 
     st.session_state.trigger_run = False
 
 # --------- Selected list (stocks + ETFs) ---------
 if st.session_state.vol_topN is not None and not st.session_state.vol_topN.empty:
-    st.subheader(f"Selected Tickers (Top {TOP_STOCKS} Stocks by 3M Avg Vol + ETFs)")
+    st.subheader("Selected Tickers")
     base = st.session_state.vol_topN.copy()
-    source_order = pd.api.types.CategoricalDtype(categories=["Stock", "ETF"], ordered=True)
-    base["Source"] = base["source"].astype(source_order)
-    base["SourceOrder"] = base["Source"].cat.codes
-    base["AvgVolNum"] = pd.to_numeric(base["avg_vol_3m"], errors="coerce")
-    base = base.sort_values(by=["SourceOrder", "AvgVolNum"], ascending=[True, False], kind="mergesort")
+    # Simple table for clarity
     disp = pd.DataFrame({
         "Ticker": base["ticker"],
-        "Avg Vol (3m)": base["AvgVolNum"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else EM_DASH),
+        "Avg Vol (3m)": base["avg_vol_3m"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else EM_DASH),
         "Last Close": base["last_close"].apply(lambda v: f"${v:,.2f}" if pd.notna(v) else EM_DASH),
-        "Source": base["Source"].astype(str),
+        "Source": base["source"].astype(str),
     })
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
 # --------- Forward-vol table ---------
 df_current = st.session_state.df
 if df_current is None or df_current.empty:
-    st.info("Click **Build List & Run** to rank the entire US universe and scan options.")
+    st.warning("No rows to display. See diagnostics below.")
 else:
-    # Diagnostics
+    # Diagnostics summary
     st.write({
         "tickers_selected": len(st.session_state.tickers or []),
         "df_rows": len(df_current),
@@ -779,65 +813,49 @@ else:
 
     display_labels = [DISPLAY_MAP[k] for k in DISPLAY_KEYS if k in df_current.columns]
     default_label = DISPLAY_MAP.get("ff", display_labels[0])
-
-    c1, c2, c3 = st.columns([3, 1.2, 1.8], vertical_alignment="bottom")
+    c1, c2 = st.columns([3, 1])
     with c1:
         sort_label = st.selectbox("Sort by", options=display_labels,
                                   index=display_labels.index(default_label), key="sort_col_label")
     with c2:
         sort_ascending = st.toggle("Ascending", value=False, key="sort_asc")
-    with c3:
-        st.caption("Blanks always shown last")
 
     sort_key = LABEL_TO_KEY.get(sort_label, "ff")
     df_sorted = sort_df(df_current, sort_key, sort_ascending)
 
-    # Optional debug "reason" toggle
-    show_debug = st.toggle("Show debug column", value=False, key="show_debug_reason")
     base_cols = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
-    cols = base_cols + (["reason"] if (show_debug and "reason" in df_sorted.columns) else [])
-    df_display = df_sorted[cols].copy()
+    df_display = df_sorted[base_cols].copy()
     df_display.rename(columns={k: DISPLAY_MAP.get(k, k) for k in base_cols}, inplace=True)
 
-    tags_series = df_sorted["_tags"] if "_tags" in df_sorted.columns else pd.Series([[]]*len(df_sorted), index=df_sorted.index)
+    st.subheader("Results")
+    st.dataframe(df_display, use_container_width=True, hide_index=True)
 
-    def _highlight_row(row: pd.Series):
-        tags = tags_series.iloc[row.name] if row.name in tags_series.index else []
-        blocked = isinstance(tags, (list, tuple, set)) and ("blocked" in tags)
-        earn = isinstance(tags, (list, tuple, set)) and ("earn" in tags)
-        hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
-        no_iv = isinstance(tags, (list, tuple, set)) and ("no_iv" in tags)
-        if blocked:
-            color = "#ffcdd2"  # red-ish
-        elif earn and hot:
-            color = "#ffe0b2"  # both
-        elif earn:
-            color = "#fff9c4"  # yellow
-        elif hot:
-            color = "#dcedc8"  # green
-        elif no_iv:
-            color = "#e0e0e0"  # grey
-        else:
-            color = "#ffffff"
-        return [f"background-color:{color}; color:#000000;"] * len(row)
+# --------- Diagnostics ---------
+st.divider()
+st.subheader("Diagnostics")
 
-    styled = (df_display.style
-              .apply(_highlight_row, axis=1)
-              .set_properties(**{"border":"1px solid #bbb","color":"#000","font-size":"14px"}))
+# High-level data reachability per ticker
+diag_rows = pd.DataFrame(st.session_state.get("_diag_rows", []))
+if not diag_rows.empty:
+    st.markdown("**Data reachability (spot & expiries)**")
+    st.dataframe(diag_rows, use_container_width=True, hide_index=True)
+else:
+    st.caption("No reachability diagnostics gathered yet.")
 
-    st.markdown("""
-        <style>
-        table {border-collapse: collapse; width: 100%;}
-        th {position: sticky; top: 0; background-color: #f0f0f0; color: #000; font-weight: bold;}
-        tr:nth-child(even) {background-color: #fafafa;}
-        tr:hover {background-color: #e0e0e0;}
-        </style>
-    """, unsafe_allow_html=True)
+# IV reachability per pair
+diag_iv = pd.DataFrame(st.session_state.get("_diag_iv", []))
+if not diag_iv.empty:
+    st.markdown("**IV reachability (per pair)**")
+    st.dataframe(diag_iv, use_container_width=True, hide_index=True)
 
-    st.markdown(styled.to_html(), unsafe_allow_html=True)
-    st.caption("🟥 Blocked (earnings before Exp 1) 🟨 Earnings in window 🟩 FF ≥ 0.20 🟧 Earnings+Hot ⬜ No IV data")
+# Raw logs
+logs = st.session_state.get("_debug_logs", [])
+if logs:
+    st.markdown("**Debug logs**")
+    for line in logs[:400]:
+        st.text(f"• {line}")
 
 st.markdown(
-    "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
+    "<p style='text-align:center; font-size:14px; color:#888;'>Built with ❤️ for Skyler — Safe Mode surfaces where the data breaks so you can fix it fast.</p>",
     unsafe_allow_html=True,
 )
