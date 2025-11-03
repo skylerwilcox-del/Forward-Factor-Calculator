@@ -297,19 +297,25 @@ def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
         return 0.5 * (c_iv + p_iv)
     return c_iv if c_iv is not None else p_iv
 
+def _strikes_from_chain(df: pd.DataFrame) -> set:
+    """Extract a clean set of float strikes from a calls/puts dataframe."""
+    if df is None or df.empty or "strike" not in df.columns:
+        return set()
+    s = pd.to_numeric(df["strike"], errors="coerce")
+    return set(s.dropna().astype(float).tolist())
+
 def common_atm_strike(ticker: str, exp1: str, exp2: str, spot: float) -> Optional[float]:
+    """Return the shared strike (closest to spot) that exists in both expiries."""
     c1, p1 = get_chain(ticker, exp1)
     c2, p2 = get_chain(ticker, exp2)
-    s1 = set()
-    if not (c1.empty and p1.empty):
-        s1 = set(map(float, pd.Index(sorted(set(pd.to_numeric(c1.get("strike", pd.Series()), errors="coerce").dropna().tolist() +
-                                                     pd.to_numeric(p1.get("strike", pd.Series()), errors="coerce").dropna().tolist()))))))
-    s2 = set()
-    if not (c2.empty and p2.empty):
-        s2 = set(map(float, pd.Index(sorted(set(pd.to_numeric(c2.get("strike", pd.Series()), errors="coerce").dropna().tolist() +
-                                                     pd.to_numeric(p2.get("strike", pd.Series()), errors="coerce").dropna().tolist()))))))
-    inter = list(s1.intersection(s2))
-    return float(min(inter, key=lambda s: abs(s - spot))) if inter else None
+
+    s1 = _strikes_from_chain(c1) | _strikes_from_chain(p1)
+    s2 = _strikes_from_chain(c2) | _strikes_from_chain(p2)
+
+    inter = s1 & s2
+    if not inter:
+        return None
+    return float(min(inter, key=lambda s: abs(s - spot)))
 
 def call_mid_at(calls: pd.DataFrame, strike: float) -> Optional[float]:
     if calls is None or calls.empty:
@@ -793,3 +799,4 @@ st.markdown(
     "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
     unsafe_allow_html=True,
 )
+
