@@ -30,11 +30,11 @@ TOP_STOCKS = 27
 FIXED_ETFS = ["SPY", "QQQ", "VOO"]
 ETF_SET = set(FIXED_ETFS)
 
-# Download tuning (reduced for better reliability)
-BATCH_3MO = 25
-MAX_WORKERS = 6   # slightly lower to avoid throttling
+# Download tuning (slightly conservative to reduce throttling)
+BATCH_3MO = 20
+MAX_WORKERS = 5
 
-# Large liquid fallback universe (used if ticker universe lookup fails)
+# Large liquid fallback universe
 FALLBACK_LIQUID = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","AMD","NFLX","CRM","COST","PEP","ADBE","INTC",
     "UBER","QCOM","AMAT","TSM","ORCL","PFE","MRK","JNJ","LLY","V","MA","JPM","BAC","WFC","C","GS","MS","SCHW","BLK",
@@ -43,6 +43,9 @@ FALLBACK_LIQUID = [
     "MU","NXPI","TXN","ADI","ON","LRCX","KLAC","ASML","BABA","BIDU","PDD","RIO","BHP","CVX","XOM","COP","OXY","SLB",
     "F","GM","RIVN","LCID","NIO","CCL","AAL","UAL","DAL","UPS","FDX","SOFI","COIN","HOOD","GME","OPEN"
 ]
+
+EM_DASH = "—"
+BLANKS = {"", "-", "—", "–", "---"}
 
 # =========================
 # Helpers
@@ -56,19 +59,6 @@ def _first_float(val) -> Optional[float]:
         return None if math.isnan(x) else x
     except Exception:
         return None
-
-def _safe_mid(row: pd.Series) -> Optional[float]:
-    try:
-        bid = float(row.get("bid", float("nan")))
-        ask = float(row.get("ask", float("nan")))
-        last = float(row.get("lastPrice", float("nan")))
-    except Exception:
-        return None
-    if not math.isnan(bid) and not math.isnan(ask):
-        return 0.5 * (bid + ask)
-    if not math.isnan(last):
-        return last
-    return None
 
 def _calc_dte(expiry_iso: str) -> int:
     y, m, d = map(int, expiry_iso.split("-"))
@@ -86,16 +76,24 @@ def _normalize_tickers(raw: str) -> List[str]:
     for t in raw.replace(",", " ").split():
         t = t.strip().upper()
         if t and t not in seen:
-            seen.add(t)
-            out.append(t)
+            seen.add(t); out.append(t)
     return out
 
 def _is_clean_us_symbol(sym: str) -> bool:
-    return bool(re.fullmatch(r"[A-Z0-9]{1,5}(-[A-Z0-9]{1,2})?", sym))
+    return bool(re.fullmatch(r"[A-Z0-9]{1,5}(?:-[A-Z0-9]{1,2})?", sym))
 
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
+
+def _fmt_pct(x: Optional[float]) -> str:
+    return EM_DASH if x is None else f"{x:.2f}%"
+
+def _fmt_money(x: Optional[float]) -> str:
+    return EM_DASH if x is None else f"{x:.2f}"
+
+def _dash_if_none(x):
+    return EM_DASH if x is None else x
 
 # Simple retry decorator
 def _retry(n=3, wait=0.5):
@@ -151,54 +149,61 @@ def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
         dfc = dfc[dfc["et_date"] < today_et]
     return dfc.drop(columns=["et_date"])
 
-@st.cache_data(ttl=1200, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def _safe_multi_download(tickers, period, interval):
     if not tickers:
         return pd.DataFrame()
     try:
         return yf.download(
-            tickers=tickers,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            group_by="ticker",
-            threads=True,
-            progress=False,
+            tickers=tickers, period=period, interval=interval,
+            auto_adjust=False, group_by="ticker", threads=True, progress=False
         )
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=1200, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def _safe_single_download(ticker, period, interval):
     try:
         return yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=1800, show_spinner=False)
-@_retry(n=3, wait=0.5)
+@st.cache_data(ttl=900, show_spinner=False)
+@_retry(n=3, wait=0.6)
 def get_spot(ticker: str) -> Optional[float]:
+    """Robust spot getter: fast_info -> info -> 1d -> 5d -> 1m last"""
     tk = yf.Ticker(ticker)
-    spot = None
+    # 1) fast_info
     try:
         fi = getattr(tk, "fast_info", {}) or {}
-        spot = fi.get("last_price")
+        v = fi.get("last_price") or fi.get("last_price_raw") or fi.get("regular_market_price")
+        v = _first_float(v)
+        if v is not None: return v
     except Exception:
         pass
-    if spot is None:
+    # 2) info
+    try:
+        inf = getattr(tk, "info", {}) or {}
+        v = inf.get("regularMarketPrice") or inf.get("currentPrice")
+        v = _first_float(v)
+        if v is not None: return v
+    except Exception:
+        pass
+    # 3) history daily
+    for per, intrv in [("1d","1m"), ("5d","1d")]:
         try:
-            inf = getattr(tk, "info", {}) or {}
-            spot = inf.get("regularMarketPrice")
+            px = tk.history(period=per, interval=intrv, auto_adjust=False)
+            if not px.empty:
+                if "Close" in px.columns and not px["Close"].dropna().empty:
+                    return float(px["Close"].dropna().iloc[-1])
+                if "close" in px.columns and not px["close"].dropna().empty:
+                    return float(px["close"].dropna().iloc[-1])
         except Exception:
             pass
-    if spot is None:
-        px = tk.history(period="5d", interval="1d", auto_adjust=False)
-        if not px.empty and "Close" in px.columns:
-            spot = float(px["Close"].dropna().iloc[-1])
-    return _first_float(spot)
+    return None
 
-@st.cache_data(ttl=1200, show_spinner=False)
-@_retry(n=3, wait=0.7)
+@st.cache_data(ttl=900, show_spinner=False)
+@_retry(n=3, wait=0.6)
 def get_options(ticker: str) -> List[str]:
     opts = []
     tk = yf.Ticker(ticker)
@@ -206,19 +211,27 @@ def get_options(ticker: str) -> List[str]:
         opts = tk.options or []
     except Exception:
         pass
+    # Validate yyyy-mm-dd strings only
     return [e for e in opts if isinstance(e, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", e)]
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 @_retry(n=3, wait=0.7)
 def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     oc = yf.Ticker(ticker).option_chain(expiry)
     calls = oc.calls.copy() if hasattr(oc, "calls") else pd.DataFrame()
     puts  = oc.puts.copy()  if hasattr(oc, "puts")  else pd.DataFrame()
+    # Normalize column names
     for df in (calls, puts):
         if not df.empty:
-            if "lastPrice" not in df.columns and "last_price" in df.columns:
+            cols = {c.lower(): c for c in df.columns}
+            # ensure lastPrice / impliedVolatility exist
+            if "lastprice" in cols and "lastPrice" not in df.columns:
+                df.rename(columns={"lastprice":"lastPrice"}, inplace=True)
+            if "last_price" in df.columns and "lastPrice" not in df.columns:
                 df.rename(columns={"last_price":"lastPrice"}, inplace=True)
-            if "impliedVolatility" not in df.columns and "implied_volatility" in df.columns:
+            if "impliedvolatility" in cols and "impliedVolatility" not in df.columns:
+                df.rename(columns={"impliedvolatility":"impliedVolatility"}, inplace=True)
+            if "implied_volatility" in df.columns and "impliedVolatility" not in df.columns:
                 df.rename(columns={"implied_volatility":"impliedVolatility"}, inplace=True)
     return calls, puts
 
@@ -226,8 +239,9 @@ def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
 def get_next_earnings_date(ticker: str) -> Optional[date]:
     today = _now_pacific_date()
     tk = yf.Ticker(ticker)
+    # Preferred: get_earnings_dates
     try:
-        df = tk.get_earnings_dates(limit=8)
+        df = tk.get_earnings_dates(limit=10)
         if df is not None and not df.empty:
             col = "Earnings Date" if "Earnings Date" in df.columns else df.columns[0]
             dates = pd.to_datetime(df[col], utc=True, errors="coerce").dt.date
@@ -236,6 +250,7 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
                 return min(fut)
     except Exception:
         pass
+    # Fallback: calendar/info
     try_sources = (getattr(tk, "calendar", None), getattr(tk, "info", {}), getattr(tk, "fast_info", {}))
     for src in try_sources:
         if src is None:
@@ -255,40 +270,65 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
 # =========================
 # IV/FF calculations (tolerant)
 # =========================
+def _nearest_strike(series: pd.Series, target: float) -> Optional[float]:
+    s = pd.to_numeric(series, errors="coerce").dropna().astype(float)
+    if s.empty:
+        return None
+    return float(min(s, key=lambda v: abs(v - target)))
+
+def _safe_mid(row: pd.Series) -> Optional[float]:
+    try:
+        bid = _first_float(row.get("bid"))
+        ask = _first_float(row.get("ask"))
+        last = _first_float(row.get("lastPrice"))
+    except Exception:
+        return None
+    if bid is not None and ask is not None:
+        return 0.5*(bid+ask)
+    return last
+
+def _iv_from_df_at_strike(df: pd.DataFrame, strike: float) -> Optional[float]:
+    if df is None or df.empty:
+        return None
+    strikes = pd.to_numeric(df["strike"], errors="coerce")
+    # Tolerant match
+    idx = np.where(np.isclose(strikes, strike, rtol=0, atol=max(0.01, 0.002*max(1.0, strike))))[0]
+    if len(idx) == 0:
+        # Fall back to nearest row
+        nearest = _nearest_strike(df["strike"], strike)
+        if nearest is None:
+            return None
+        idx = np.where(np.isclose(strikes, nearest, rtol=0, atol=max(0.01, 0.002*max(1.0, nearest))))[0]
+        if len(idx) == 0:
+            return None
+    row = df.iloc[idx[0]]
+    iv = _first_float(row.get("impliedVolatility"))
+    if iv is None:
+        return None
+    # yfinance IV is 0-1; convert to %
+    return float(iv)*100.0 if iv <= 1.5 else float(iv)
+
 def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     calls, puts = get_chain(ticker, expiry)
-    if (calls is None or calls.empty) and (puts is None or puts.empty):
-        return None
-
-    strikes = set()
-    if calls is not None and not calls.empty:
-        strikes |= set(pd.to_numeric(calls["strike"], errors="coerce").dropna().astype(float))
-    if puts is not None and not puts.empty:
-        strikes |= set(pd.to_numeric(puts["strike"], errors="coerce").dropna().astype(float))
+    # Use nearest strike from union of call/put strikes
+    strikes = []
+    for df in (calls, puts):
+        if df is not None and not df.empty and "strike" in df.columns:
+            strikes.extend(pd.to_numeric(df["strike"], errors="coerce").dropna().astype(float).tolist())
     if not strikes:
         return None
-
     atm = min(strikes, key=lambda s: abs(s - spot))
-
-    def _iv(df):
-        if df is None or df.empty:
-            return None
-        row = df.loc[pd.to_numeric(df["strike"], errors="coerce") == atm]
-        if row.empty:
-            return None
-        iv = _first_float(row["impliedVolatility"].iloc[0])
-        return None if iv is None else iv * 100.0
-
-    c_iv, p_iv = _iv(calls), _iv(puts)
+    c_iv = _iv_from_df_at_strike(calls, atm)
+    p_iv = _iv_from_df_at_strike(puts, atm)
     if c_iv is not None and p_iv is not None:
-        return 0.5 * (c_iv + p_iv)
+        return 0.5*(c_iv+p_iv)
     return c_iv if c_iv is not None else p_iv
 
 def _strikes_from_chain(df: pd.DataFrame) -> set:
     if df is None or df.empty or "strike" not in df.columns:
         return set()
-    s = pd.to_numeric(df["strike"], errors="coerce")
-    return set(s.dropna().astype(float).tolist())
+    s = pd.to_numeric(df["strike"], errors="coerce").dropna().astype(float)
+    return set(s.tolist())
 
 def common_atm_strike(ticker: str, exp1: str, exp2: str, spot: float) -> Optional[float]:
     c1, p1 = get_chain(ticker, exp1)
@@ -297,16 +337,27 @@ def common_atm_strike(ticker: str, exp1: str, exp2: str, spot: float) -> Optiona
     s2 = _strikes_from_chain(c2) | _strikes_from_chain(p2)
     inter = s1 & s2
     if not inter:
-        return None
+        # Tolerant: pick nearest strike in s1 and then snap to nearest in s2
+        if not s1 or not s2:
+            return None
+        a = min(s1, key=lambda s: abs(s-spot))
+        b = min(s2, key=lambda s: abs(s-spot))
+        # if still far, give up
+        if abs(a-b) > max(0.1, 0.003*spot):
+            return None
+        return float(0.5*(a+b))
     return float(min(inter, key=lambda s: abs(s - spot)))
 
 def call_mid_at(calls: pd.DataFrame, strike: float) -> Optional[float]:
     if calls is None or calls.empty:
         return None
-    row = calls.loc[pd.to_numeric(calls["strike"], errors="coerce") == strike]
-    return None if row.empty else _safe_mid(row.iloc[0])
+    strikes = pd.to_numeric(calls["strike"], errors="coerce")
+    idx = np.where(np.isclose(strikes, strike, rtol=0, atol=max(0.01, 0.002*max(1.0, strike))))[0]
+    if len(idx) == 0:
+        return None
+    return _safe_mid(calls.iloc[idx[0]])
 
-def calendar_debit(ticker: str, e1: str, e2: str, spot: float):
+def calendar_debit(ticker: str, e1: str, e2: str, spot: float) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     c1, _ = get_chain(ticker, e1)
     c2, _ = get_chain(ticker, e2)
     strike = common_atm_strike(ticker, e1, e2, spot)
@@ -315,14 +366,14 @@ def calendar_debit(ticker: str, e1: str, e2: str, spot: float):
     short_mid, long_mid = call_mid_at(c1, strike), call_mid_at(c2, strike)
     if short_mid is None or long_mid is None:
         return strike, short_mid, long_mid, None
-    return strike, short_mid, long_mid, long_mid - short_mid
+    return strike, short_mid, long_mid, float(long_mid - short_mid)
 
 def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
     denom = T2 - T1
     if denom <= 0:
         return None, None
     fwd_var = (s2**2 * T2 - s1**2 * T1) / denom
-    if fwd_var < 0:
+    if fwd_var <= 0:
         return None, None
     fwd_sigma = math.sqrt(fwd_var)
     ff = None if fwd_sigma == 0 else (s1 - fwd_sigma) / fwd_sigma
@@ -349,31 +400,29 @@ def _pick_next(ed: List[Tuple[str, int]], target_dte: int) -> Optional[Tuple[str
             return e
     return ed[-1]
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
     rows: List[Dict] = []
 
     spot = get_spot(ticker)
     if spot is None:
         rows.append({
-            "ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
-            "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-            "cal_debit": "—","earn_in_window": "—","_tags": ["no_spot"], "reason": "no_spot"
+            "ticker": ticker, "pair": EM_DASH, "exp1": EM_DASH, "dte1": EM_DASH, "iv1": EM_DASH,
+            "exp2": EM_DASH, "dte2": EM_DASH, "iv2": EM_DASH, "fwd_vol": EM_DASH, "ff": EM_DASH,
+            "cal_debit": EM_DASH, "earn_in_window": EM_DASH, "_tags": ["no_spot"], "reason": "no_spot"
         })
         return rows
 
     expiries = get_options(ticker)
     if not expiries:
         rows.append({
-            "ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
-            "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-            "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"], "reason": "no_exp"
+            "ticker": ticker, "pair": EM_DASH, "exp1": EM_DASH, "dte1": EM_DASH, "iv1": EM_DASH,
+            "exp2": EM_DASH, "dte2": EM_DASH, "iv2": EM_DASH, "fwd_vol": EM_DASH, "ff": EM_DASH,
+            "cal_debit": EM_DASH, "earn_in_window": EM_DASH, "_tags": ["no_exp"], "reason": "no_exp"
         })
         return rows
 
     ed = _expiry_dtes(expiries)
-
-    # Robust anchors
     e7  = _pick_next(ed, 7)
     e14 = _pick_next(ed, 14)
     e30 = _pick_next(ed, 30)
@@ -381,11 +430,9 @@ def screen_ticker(ticker: str) -> List[Dict]:
     e90 = _pick_next(ed, 90)
 
     pairs: List[Tuple[str, Tuple[str,int], Tuple[str,int]]] = []
-
     def _add(label, a, b):
         if a and b and b[1] > a[1]:
             pairs.append((label, a, b))
-
     _add("7–14",  e7,  e14)
     _add("7–30",  e7,  e30)
     _add("30–60", e30, e60)
@@ -396,18 +443,18 @@ def screen_ticker(ticker: str) -> List[Dict]:
 
     if not pairs:
         rows.append({
-            "ticker": ticker, "pair": "—",
-            "exp1": "—","dte1": "—","iv1": "—",
-            "exp2": "—","dte2": "—","iv2": "—",
-            "fwd_vol": "—","ff": "—","cal_debit": "—",
-            "earn_in_window": earn_dt.strftime("%Y-%m-%d") if earn_dt else "—",
+            "ticker": ticker, "pair": EM_DASH,
+            "exp1": EM_DASH, "dte1": EM_DASH, "iv1": EM_DASH,
+            "exp2": EM_DASH, "dte2": EM_DASH, "iv2": EM_DASH,
+            "fwd_vol": EM_DASH, "ff": EM_DASH, "cal_debit": EM_DASH,
+            "earn_in_window": earn_dt.strftime("%Y-%m-%d") if earn_dt else EM_DASH,
             "_tags": ["no_pairs"], "reason": "no_pairs"
         })
         return rows
 
     for label, (exp1, dte1), (exp2, dte2) in pairs:
         tags: List[str] = []
-        earn_txt = "—"
+        earn_txt = EM_DASH
         e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
 
         if earn_dt:
@@ -417,42 +464,38 @@ def screen_ticker(ticker: str) -> List[Dict]:
             elif e1d and e2d and e1d <= earn_dt <= e2d:
                 tags.append("earn")
 
-        iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
-        reason = ""
+        iv1 = atm_iv(ticker, exp1, spot)
+        iv2 = atm_iv(ticker, exp2, spot)
 
-        if iv1 is None and iv2 is None:
-            rows.append({
-                "ticker": ticker, "pair": label,
-                "exp1": exp1, "dte1": dte1, "iv1": "—",
-                "exp2": exp2, "dte2": dte2, "iv2": "—",
-                "fwd_vol": "—", "ff": "—",
-                "cal_debit": "—", "earn_in_window": earn_txt,
-                "_tags": tags + ["no_iv"], "reason": "no_iv_both"
-            })
-            continue
+        fwd_txt, ff_txt = EM_DASH, EM_DASH
+        reason = "ok"
 
-        fwd_txt, ff_txt = "—", "—"
         if iv1 is not None and iv2 is not None:
             s1, s2 = iv1/100.0, iv2/100.0
             T1, T2 = dte1/365.0, dte2/365.0
             fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
-            if fwd_sigma is not None: fwd_txt = f"{(fwd_sigma*100):.2f}%"
+            if fwd_sigma is not None:
+                fwd_txt = _fmt_pct(fwd_sigma*100.0)
             if ff is not None:
-                ff_txt = f"{(ff*100):.2f}%"
-                if ff >= 0.20: tags.append("hot")
+                ff_txt = _fmt_pct(ff*100.0)
+                if ff >= 0.20:
+                    tags.append("hot")
         else:
-            reason = "iv1_missing" if iv1 is None else "iv2_missing"
+            reason = "iv1_missing" if iv1 is None and iv2 is not None else (
+                     "iv2_missing" if iv2 is None and iv1 is not None else "no_iv_both")
+            if reason == "no_iv_both":
+                tags.append("no_iv")
 
         _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
 
         rows.append({
             "ticker": ticker, "pair": label,
-            "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%" if iv1 is not None else "—",
-            "exp2": exp2, "dte2": dte2, "iv2": f"{iv2:.2f}%" if iv2 is not None else "—",
+            "exp1": exp1, "dte1": dte1, "iv1": _fmt_pct(iv1) if iv1 is not None else EM_DASH,
+            "exp2": exp2, "dte2": dte2, "iv2": _fmt_pct(iv2) if iv2 is not None else EM_DASH,
             "fwd_vol": fwd_txt, "ff": ff_txt,
-            "cal_debit": f"{debit:.2f}" if debit is not None else "—",
+            "cal_debit": _fmt_money(debit),
             "earn_in_window": earn_txt,
-            "_tags": tags, "reason": reason or "ok"
+            "_tags": tags, "reason": reason
         })
 
     return rows
@@ -470,12 +513,12 @@ def scan_many(tickers: List[str]) -> pd.DataFrame:
             try:
                 rows.extend(fut.result())
             except Exception as e:
-                rows.append({"ticker": t, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
-                             "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-                             "cal_debit": "—","earn_in_window": "—","_tags": [f"error:{type(e).__name__}"], "reason": "error"})
+                rows.append({"ticker": t, "pair": EM_DASH,"exp1": EM_DASH,"dte1": EM_DASH,"iv1": EM_DASH,
+                             "exp2": EM_DASH,"dte2": EM_DASH,"iv2": EM_DASH,"fwd_vol": EM_DASH,"ff": EM_DASH,
+                             "cal_debit": EM_DASH,"earn_in_window": EM_DASH,"_tags": [f"error:{type(e).__name__}"], "reason": "error"})
             done += 1
             progress.progress(done / len(tickers), text=f"Scanned {t} ({done}/{len(tickers)})")
-            time.sleep(0.12)  # small delay to reduce throttling
+            time.sleep(0.10)
     progress.empty()
     df = pd.DataFrame(rows)
     if df.empty:
@@ -485,19 +528,17 @@ def scan_many(tickers: List[str]) -> pd.DataFrame:
     return df
 
 # =========================
-# Sorting helpers (stable & robust)
+# Sorting helpers
 # =========================
-_BLANK_SET = {"", "-", "—", "–"}
-
 def _build_sort_columns(series: pd.Series) -> pd.DataFrame:
     s = series.copy()
     s_str = s.astype(str).str.strip()
-    is_blank = s.isna() | s_str.isin(_BLANK_SET)
+    is_blank = s.isna() | s_str.isin(BLANKS)
 
     pct_val = pd.to_numeric(s_str.str.rstrip("%").str.replace(",", "", regex=False), errors="coerce")
     pct_mask = s_str.str.endswith("%") & ~pd.isna(pct_val)
 
-    cur_mask = s_str.str.match(r"^\(?\$\s*[\d,]+(?:\.\d+)?\)?$")
+    cur_mask = s_str.str.match(r"^\(?\$?\s*[\d,]+(?:\.\d+)?\)?$")
     cur_core = (s_str
         .str.replace(r"^\(", "", regex=True)
         .str.replace(r"\)$", "", regex=True)
@@ -546,7 +587,7 @@ def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
 # =========================
 # 3M Avg Volume ranking — NO GATING
 # =========================
-@st.cache_data(ttl=1200, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close"])
@@ -596,7 +637,7 @@ def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
-@st.cache_data(ttl=1200, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
     universe = get_us_stock_universe()
     extras = [e.strip().upper() for e in extras if _is_clean_us_symbol(e)]
@@ -620,6 +661,7 @@ def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close","source"])
 
     vol_df = pd.concat(all_rows, ignore_index=True).dropna(subset=["avg_vol_3m"])
+    # Ensure extras are present
     missing_extras = [e for e in extras if e not in vol_df["ticker"].unique().tolist()]
     if missing_extras:
         extra_fix = _batch_3mo_stats(missing_extras)
@@ -717,8 +759,8 @@ if st.session_state.vol_topN is not None and not st.session_state.vol_topN.empty
     base = base.sort_values(by=["SourceOrder", "AvgVolNum"], ascending=[True, False], kind="mergesort")
     disp = pd.DataFrame({
         "Ticker": base["ticker"],
-        "Avg Vol (3m)": base["AvgVolNum"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "—"),
-        "Last Close": base["last_close"].apply(lambda v: f"${v:,.2f}" if pd.notna(v) else "—"),
+        "Avg Vol (3m)": base["AvgVolNum"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else EM_DASH),
+        "Last Close": base["last_close"].apply(lambda v: f"${v:,.2f}" if pd.notna(v) else EM_DASH),
         "Source": base["Source"].astype(str),
     })
     st.dataframe(disp, use_container_width=True, hide_index=True)
@@ -732,6 +774,7 @@ else:
     st.write({
         "tickers_selected": len(st.session_state.tickers or []),
         "df_rows": len(df_current),
+        "rows_with_iv": int(((df_current["iv1"] != EM_DASH) & (df_current["iv2"] != EM_DASH)).sum()) if "iv1" in df_current and "iv2" in df_current else 0
     })
 
     display_labels = [DISPLAY_MAP[k] for k in DISPLAY_KEYS if k in df_current.columns]
