@@ -32,7 +32,7 @@ ETF_SET = set(FIXED_ETFS)
 
 # Download tuning (reduced for better reliability)
 BATCH_3MO = 25
-MAX_WORKERS = 8
+MAX_WORKERS = 6   # slightly lower to avoid throttling
 
 # Large liquid fallback universe (used if ticker universe lookup fails)
 FALLBACK_LIQUID = [
@@ -91,7 +91,6 @@ def _normalize_tickers(raw: str) -> List[str]:
     return out
 
 def _is_clean_us_symbol(sym: str) -> bool:
-    # Allow up to 5 letters/digits (+ optional hyphen suffix). Skip obvious non-US/OTC prefixes.
     return bool(re.fullmatch(r"[A-Z0-9]{1,5}(-[A-Z0-9]{1,2})?", sym))
 
 def _chunks(lst, n):
@@ -109,7 +108,6 @@ def _retry(n=3, wait=0.5):
                 except Exception as e:
                     last = e
                     time.sleep(wait)
-            # if all attempts failed, re-raise the last exception
             raise last
         return wrap
     return deco
@@ -129,18 +127,15 @@ def get_us_stock_universe() -> List[str]:
                     candidates.extend([str(t).strip().upper() for t in vals if t])
         except Exception:
             continue
-    # sanitize
     candidates = [t for t in dict.fromkeys(candidates) if _is_clean_us_symbol(t)]
     if not candidates:
         candidates = FALLBACK_LIQUID.copy()
-    # Ensure ETFs + a known active are present
     for t in list(ETF_SET) + ["OPEN"]:
         if t not in candidates and _is_clean_us_symbol(t):
             candidates.append(t)
     return list(dict.fromkeys(candidates))
 
 def _exclude_today_if_open(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove today's partial bar until after ~4:05pm ET, so averages are comparable."""
     if df is None or df.empty:
         return df
     idx = df.index
@@ -185,20 +180,17 @@ def _safe_single_download(ticker, period, interval):
 def get_spot(ticker: str) -> Optional[float]:
     tk = yf.Ticker(ticker)
     spot = None
-    # fast_info
     try:
         fi = getattr(tk, "fast_info", {}) or {}
         spot = fi.get("last_price")
     except Exception:
         pass
-    # info
     if spot is None:
         try:
             inf = getattr(tk, "info", {}) or {}
             spot = inf.get("regularMarketPrice")
         except Exception:
             pass
-    # history
     if spot is None:
         px = tk.history(period="5d", interval="1d", auto_adjust=False)
         if not px.empty and "Close" in px.columns:
@@ -214,7 +206,6 @@ def get_options(ticker: str) -> List[str]:
         opts = tk.options or []
     except Exception:
         pass
-    # Keep only YYYY-MM-DD
     return [e for e in opts if isinstance(e, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", e)]
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -223,7 +214,6 @@ def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     oc = yf.Ticker(ticker).option_chain(expiry)
     calls = oc.calls.copy() if hasattr(oc, "calls") else pd.DataFrame()
     puts  = oc.puts.copy()  if hasattr(oc, "puts")  else pd.DataFrame()
-    # Standardize columns we rely on
     for df in (calls, puts):
         if not df.empty:
             if "lastPrice" not in df.columns and "last_price" in df.columns:
@@ -234,10 +224,8 @@ def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_next_earnings_date(ticker: str) -> Optional[date]:
-    """Return the next *future* earnings date as a date(), or None if unknown."""
     today = _now_pacific_date()
     tk = yf.Ticker(ticker)
-    # Primary: get_earnings_dates
     try:
         df = tk.get_earnings_dates(limit=8)
         if df is not None and not df.empty:
@@ -248,7 +236,6 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
                 return min(fut)
     except Exception:
         pass
-    # Fallbacks
     try_sources = (getattr(tk, "calendar", None), getattr(tk, "info", {}), getattr(tk, "fast_info", {}))
     for src in try_sources:
         if src is None:
@@ -298,20 +285,16 @@ def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     return c_iv if c_iv is not None else p_iv
 
 def _strikes_from_chain(df: pd.DataFrame) -> set:
-    """Extract a clean set of float strikes from a calls/puts dataframe."""
     if df is None or df.empty or "strike" not in df.columns:
         return set()
     s = pd.to_numeric(df["strike"], errors="coerce")
     return set(s.dropna().astype(float).tolist())
 
 def common_atm_strike(ticker: str, exp1: str, exp2: str, spot: float) -> Optional[float]:
-    """Return the shared strike (closest to spot) that exists in both expiries."""
     c1, p1 = get_chain(ticker, exp1)
     c2, p2 = get_chain(ticker, exp2)
-
     s1 = _strikes_from_chain(c1) | _strikes_from_chain(p1)
     s2 = _strikes_from_chain(c2) | _strikes_from_chain(p2)
-
     inter = s1 & s2
     if not inter:
         return None
@@ -348,9 +331,7 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
 # =========================
 # Screener (earnings gating & visibility)
 # =========================
-@st.cache_data(ttl=900, show_spinner=False)
 def _expiry_dtes(expiries: List[str]) -> List[Tuple[str, int]]:
-    """Return [(YYYY-MM-DD, dte_int)] sorted by date."""
     out = []
     for e in expiries:
         try:
@@ -358,17 +339,15 @@ def _expiry_dtes(expiries: List[str]) -> List[Tuple[str, int]]:
             out.append((e, dte))
         except Exception:
             continue
-    # sort by actual expiry date (DTE ascending is fine)
     return sorted(out, key=lambda x: x[1])
 
 def _pick_next(ed: List[Tuple[str, int]], target_dte: int) -> Optional[Tuple[str, int]]:
-    """Pick the first expiry with DTE >= target_dte; if none, return the last one (furthest)."""
     if not ed:
         return None
     for e in ed:
         if e[1] >= target_dte:
             return e
-    return ed[-1]  # no future ≥ target; take furthest available to still build a pair
+    return ed[-1]
 
 @st.cache_data(ttl=900, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
@@ -394,7 +373,7 @@ def screen_ticker(ticker: str) -> List[Dict]:
 
     ed = _expiry_dtes(expiries)
 
-    # Anchors: choose next expiry ≥ target DTE (more robust than "nearest")
+    # Robust anchors
     e7  = _pick_next(ed, 7)
     e14 = _pick_next(ed, 14)
     e30 = _pick_next(ed, 30)
@@ -403,7 +382,6 @@ def screen_ticker(ticker: str) -> List[Dict]:
 
     pairs: List[Tuple[str, Tuple[str,int], Tuple[str,int]]] = []
 
-    # build only strictly increasing pairs (by DTE)
     def _add(label, a, b):
         if a and b and b[1] > a[1]:
             pairs.append((label, a, b))
@@ -417,7 +395,6 @@ def screen_ticker(ticker: str) -> List[Dict]:
     earn_dt = get_next_earnings_date(ticker)
 
     if not pairs:
-        # Surface the reason instead of silently showing blanks
         rows.append({
             "ticker": ticker, "pair": "—",
             "exp1": "—","dte1": "—","iv1": "—",
@@ -464,7 +441,6 @@ def screen_ticker(ticker: str) -> List[Dict]:
                 ff_txt = f"{(ff*100):.2f}%"
                 if ff >= 0.20: tags.append("hot")
         else:
-            # one of the IVs missing
             reason = "iv1_missing" if iv1 is None else "iv2_missing"
 
         _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
@@ -477,81 +453,6 @@ def screen_ticker(ticker: str) -> List[Dict]:
             "cal_debit": f"{debit:.2f}" if debit is not None else "—",
             "earn_in_window": earn_txt,
             "_tags": tags, "reason": reason or "ok"
-        })
-
-    return rows
-
-
-    ed = [(e, _calc_dte(e)) for e in expiries]
-    nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
-
-    # Anchors
-    e7, e14 = nearest(7), nearest(14)
-    e30, e60, e90 = nearest(30), nearest(60), nearest(90)
-
-    pairs = []
-    # Short-term
-    if e7 and e14 and e14[1] > e7[1]:   pairs.append(("7–14", e7, e14))
-    if e7 and e30 and e30[1] > e7[1]:   pairs.append(("7–30", e7, e30))
-    # Mid-term
-    if e30 and e60 and e60[1] > e30[1]: pairs.append(("30–60", e30, e60))
-    if e30 and e90 and e90[1] > e30[1]: pairs.append(("30–90", e30, e90))
-    if e60 and e90 and e90[1] > e60[1]: pairs.append(("60–90", e60, e90))
-
-    earn_dt = get_next_earnings_date(ticker)
-    rows = []
-
-    for label, (exp1, dte1), (exp2, dte2) in pairs:
-        # Earnings flags
-        earn_txt = "—"
-        tags: List[str] = []
-        e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
-
-        if earn_dt:
-            earn_txt = earn_dt.strftime("%Y-%m-%d")
-            if e1d and earn_dt < e1d:
-                tags.append("blocked")  # blocked by strategy but visible
-            elif e1d and e2d and e1d <= earn_dt <= e2d:
-                tags.append("earn")     # allowed but flagged
-
-        # Compute IVs (tolerant)
-        iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
-
-        # If both missing, still show the row so failures are visible
-        if iv1 is None and iv2 is None:
-            rows.append({
-                "ticker": ticker, "pair": label,
-                "exp1": exp1, "dte1": dte1, "iv1": "—",
-                "exp2": exp2, "dte2": dte2, "iv2": "—",
-                "fwd_vol": "—", "ff": "—", "cal_debit": "—",
-                "earn_in_window": earn_txt, "_tags": tags + ["no_iv"]
-            })
-            continue
-
-        # If one is present, we can still compute forward where possible
-        fwd_txt, ff_txt = "—", "—"
-        if iv1 is not None and iv2 is not None:
-            s1, s2 = iv1/100.0, iv2/100.0
-            T1, T2 = dte1/365.0, dte2/365.0
-            fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
-            if fwd_sigma is not None:
-                fwd_txt = f"{(fwd_sigma*100):.2f}%"
-            if ff is not None:
-                ff_txt = f"{(ff*100):.2f}%"
-                if ff >= 0.20:
-                    tags.append("hot")
-
-        _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
-
-        rows.append({
-            "ticker": ticker, "pair": label,
-            "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%" if iv1 is not None else "—",
-            "exp2": exp2, "dte2": dte2, "iv2": f"{iv2:.2f}%" if iv2 is not None else "—",
-            "fwd_vol": fwd_txt,
-            "ff": ff_txt,
-            "cal_debit": f"{debit:.2f}" if debit is not None else "—",
-            "earn_in_window": earn_txt,
-            "_tags": tags,
         })
 
     return rows
@@ -571,9 +472,10 @@ def scan_many(tickers: List[str]) -> pd.DataFrame:
             except Exception as e:
                 rows.append({"ticker": t, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
                              "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-                             "cal_debit": "—","earn_in_window": "—","_tags": [f"error:{type(e).__name__}"]})
+                             "cal_debit": "—","earn_in_window": "—","_tags": [f"error:{type(e).__name__}"], "reason": "error"})
             done += 1
             progress.progress(done / len(tickers), text=f"Scanned {t} ({done}/{len(tickers)})")
+            time.sleep(0.12)  # small delay to reduce throttling
     progress.empty()
     df = pd.DataFrame(rows)
     if df.empty:
@@ -646,12 +548,6 @@ def sort_df(df: pd.DataFrame, col: str, ascending: bool) -> pd.DataFrame:
 # =========================
 @st.cache_data(ttl=1200, show_spinner=False)
 def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
-    """
-    Download 3mo daily data for a batch of tickers and compute:
-      - avg_vol_3m (excluding today's partial bar)
-      - last_close (from the same dataset)
-    Returns rows only for tickers with valid volume history.
-    """
     if not tickers:
         return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close"])
     raw = _safe_multi_download(tickers, period="3mo", interval="1d")
@@ -673,7 +569,6 @@ def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
                 rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
             except Exception:
                 continue
-        # Per-ticker fallback for those yfinance skipped in the batch response
         missing = set(tickers) - set(got_syms)
         for t in list(missing):
             sub = _safe_single_download(t, period="3mo", interval="1d")
@@ -687,7 +582,6 @@ def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
             last_close = float(sub["Close"].dropna().iloc[-1]) if "Close" in sub.columns and not sub["Close"].dropna().empty else None
             rows.append({"ticker": t, "avg_vol_3m": avgv, "last_close": last_close})
     else:
-        # Degenerate single-frame: try each individually
         for t in tickers:
             sub = _safe_single_download(t, period="3mo", interval="1d")
             if sub is None or sub.empty or "Volume" not in sub.columns:
@@ -704,22 +598,12 @@ def _batch_3mo_stats(tickers: List[str]) -> pd.DataFrame:
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
-    """
-    Evaluate the ENTIRE US universe (NASDAQ + NYSE/AMEX) in 3M average volume
-    using batched downloads — no Stage-1 gating. Extras are always included.
-    """
     universe = get_us_stock_universe()
-
-    # Add user extras explicitly (and sanitize)
     extras = [e.strip().upper() for e in extras if _is_clean_us_symbol(e)]
     for e in extras:
         if e not in universe:
             universe.append(e)
-
-    # Remove fixed ETFs from the stock universe; they get appended later as ETFs
     stock_universe = [t for t in universe if t not in ETF_SET]
-
-    # Iterate ENTIRE universe in batches; build a big 3m stats table
     all_rows: List[pd.DataFrame] = []
     progress = st.progress(0.0, text="Computing 3M average volume across entire universe…")
     total = max(1, len(stock_universe))
@@ -736,22 +620,18 @@ def rank_top27_by_3m_avg_with_etfs(extras: List[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=["ticker","avg_vol_3m","last_close","source"])
 
     vol_df = pd.concat(all_rows, ignore_index=True).dropna(subset=["avg_vol_3m"])
-    # Guarantee extras are present even if yfinance missed a block (try single fetch)
     missing_extras = [e for e in extras if e not in vol_df["ticker"].unique().tolist()]
     if missing_extras:
         extra_fix = _batch_3mo_stats(missing_extras)
         if not extra_fix.empty:
             vol_df = pd.concat([vol_df, extra_fix], ignore_index=True)
 
-    # Rank by 3m average volume (descending)
     vol_df = vol_df.drop_duplicates(subset=["ticker"], keep="first")
     vol_df.sort_values("avg_vol_3m", ascending=False, inplace=True)
 
-    # Take top 27 stocks
     top_stocks = vol_df.head(TOP_STOCKS).copy()
     top_stocks["source"] = "Stock"
 
-    # Append ETFs (always include)
     etf_rows = []
     for etf in FIXED_ETFS:
         etf_df = _batch_3mo_stats([etf])
@@ -801,7 +681,7 @@ with colA:
 with colB:
     st.caption("Excludes today's partial volume until after ~4:05pm ET close.")
 
-# Auto-run once on first visit (common gotcha)
+# Auto-run once on first visit
 if st.session_state.first_visit and not st.session_state.trigger_run:
     st.session_state.trigger_run = True
     st.session_state.first_visit = False
@@ -848,7 +728,7 @@ df_current = st.session_state.df
 if df_current is None or df_current.empty:
     st.info("Click **Build List & Run** to rank the entire US universe and scan options.")
 else:
-    # Simple diagnostics to see where things failed
+    # Diagnostics
     st.write({
         "tickers_selected": len(st.session_state.tickers or []),
         "df_rows": len(df_current),
@@ -868,9 +748,13 @@ else:
 
     sort_key = LABEL_TO_KEY.get(sort_label, "ff")
     df_sorted = sort_df(df_current, sort_key, sort_ascending)
-    have_keys = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
-    df_display = df_sorted[have_keys].copy()
-    df_display.rename(columns={k: DISPLAY_MAP[k] for k in have_keys}, inplace=True)
+
+    # Optional debug "reason" toggle
+    show_debug = st.toggle("Show debug column", value=False, key="show_debug_reason")
+    base_cols = [k for k in DISPLAY_KEYS if k in df_sorted.columns]
+    cols = base_cols + (["reason"] if (show_debug and "reason" in df_sorted.columns) else [])
+    df_display = df_sorted[cols].copy()
+    df_display.rename(columns={k: DISPLAY_MAP.get(k, k) for k in base_cols}, inplace=True)
 
     tags_series = df_sorted["_tags"] if "_tags" in df_sorted.columns else pd.Series([[]]*len(df_sorted), index=df_sorted.index)
 
@@ -880,17 +764,16 @@ else:
         earn = isinstance(tags, (list, tuple, set)) and ("earn" in tags)
         hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
         no_iv = isinstance(tags, (list, tuple, set)) and ("no_iv" in tags)
-        # Priority colors
         if blocked:
-            color = "#ffcdd2"  # red-ish for blocked
+            color = "#ffcdd2"  # red-ish
         elif earn and hot:
             color = "#ffe0b2"  # both
         elif earn:
-            color = "#fff9c4"  # earnings in window
+            color = "#fff9c4"  # yellow
         elif hot:
-            color = "#dcedc8"  # FF >= 0.20
+            color = "#dcedc8"  # green
         elif no_iv:
-            color = "#e0e0e0"  # grey for missing IVs
+            color = "#e0e0e0"  # grey
         else:
             color = "#ffffff"
         return [f"background-color:{color}; color:#000000;"] * len(row)
@@ -915,5 +798,3 @@ st.markdown(
     "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
     unsafe_allow_html=True,
 )
-
-
