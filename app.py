@@ -349,22 +349,138 @@ def forward_and_ff(s1: float, T1: float, s2: float, T2: float):
 # Screener (earnings gating & visibility)
 # =========================
 @st.cache_data(ttl=900, show_spinner=False)
+def _expiry_dtes(expiries: List[str]) -> List[Tuple[str, int]]:
+    """Return [(YYYY-MM-DD, dte_int)] sorted by date."""
+    out = []
+    for e in expiries:
+        try:
+            dte = _calc_dte(e)
+            out.append((e, dte))
+        except Exception:
+            continue
+    # sort by actual expiry date (DTE ascending is fine)
+    return sorted(out, key=lambda x: x[1])
+
+def _pick_next(ed: List[Tuple[str, int]], target_dte: int) -> Optional[Tuple[str, int]]:
+    """Pick the first expiry with DTE >= target_dte; if none, return the last one (furthest)."""
+    if not ed:
+        return None
+    for e in ed:
+        if e[1] >= target_dte:
+            return e
+    return ed[-1]  # no future ≥ target; take furthest available to still build a pair
+
+@st.cache_data(ttl=900, show_spinner=False)
 def screen_ticker(ticker: str) -> List[Dict]:
+    rows: List[Dict] = []
+
     spot = get_spot(ticker)
     if spot is None:
-        return [{
+        rows.append({
             "ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
             "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-            "cal_debit": "—","earn_in_window": "—","_tags": ["no_spot"]
-        }]
+            "cal_debit": "—","earn_in_window": "—","_tags": ["no_spot"], "reason": "no_spot"
+        })
+        return rows
 
     expiries = get_options(ticker)
     if not expiries:
-        return [{
+        rows.append({
             "ticker": ticker, "pair": "—","exp1": "—","dte1": "—","iv1": "—",
             "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
-            "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"]
-        }]
+            "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"], "reason": "no_exp"
+        })
+        return rows
+
+    ed = _expiry_dtes(expiries)
+
+    # Anchors: choose next expiry ≥ target DTE (more robust than "nearest")
+    e7  = _pick_next(ed, 7)
+    e14 = _pick_next(ed, 14)
+    e30 = _pick_next(ed, 30)
+    e60 = _pick_next(ed, 60)
+    e90 = _pick_next(ed, 90)
+
+    pairs: List[Tuple[str, Tuple[str,int], Tuple[str,int]]] = []
+
+    # build only strictly increasing pairs (by DTE)
+    def _add(label, a, b):
+        if a and b and b[1] > a[1]:
+            pairs.append((label, a, b))
+
+    _add("7–14",  e7,  e14)
+    _add("7–30",  e7,  e30)
+    _add("30–60", e30, e60)
+    _add("30–90", e30, e90)
+    _add("60–90", e60, e90)
+
+    earn_dt = get_next_earnings_date(ticker)
+
+    if not pairs:
+        # Surface the reason instead of silently showing blanks
+        rows.append({
+            "ticker": ticker, "pair": "—",
+            "exp1": "—","dte1": "—","iv1": "—",
+            "exp2": "—","dte2": "—","iv2": "—",
+            "fwd_vol": "—","ff": "—","cal_debit": "—",
+            "earn_in_window": earn_dt.strftime("%Y-%m-%d") if earn_dt else "—",
+            "_tags": ["no_pairs"], "reason": "no_pairs"
+        })
+        return rows
+
+    for label, (exp1, dte1), (exp2, dte2) in pairs:
+        tags: List[str] = []
+        earn_txt = "—"
+        e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
+
+        if earn_dt:
+            earn_txt = earn_dt.strftime("%Y-%m-%d")
+            if e1d and earn_dt < e1d:
+                tags.append("blocked")
+            elif e1d and e2d and e1d <= earn_dt <= e2d:
+                tags.append("earn")
+
+        iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
+        reason = ""
+
+        if iv1 is None and iv2 is None:
+            rows.append({
+                "ticker": ticker, "pair": label,
+                "exp1": exp1, "dte1": dte1, "iv1": "—",
+                "exp2": exp2, "dte2": dte2, "iv2": "—",
+                "fwd_vol": "—", "ff": "—",
+                "cal_debit": "—", "earn_in_window": earn_txt,
+                "_tags": tags + ["no_iv"], "reason": "no_iv_both"
+            })
+            continue
+
+        fwd_txt, ff_txt = "—", "—"
+        if iv1 is not None and iv2 is not None:
+            s1, s2 = iv1/100.0, iv2/100.0
+            T1, T2 = dte1/365.0, dte2/365.0
+            fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
+            if fwd_sigma is not None: fwd_txt = f"{(fwd_sigma*100):.2f}%"
+            if ff is not None:
+                ff_txt = f"{(ff*100):.2f}%"
+                if ff >= 0.20: tags.append("hot")
+        else:
+            # one of the IVs missing
+            reason = "iv1_missing" if iv1 is None else "iv2_missing"
+
+        _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
+
+        rows.append({
+            "ticker": ticker, "pair": label,
+            "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%" if iv1 is not None else "—",
+            "exp2": exp2, "dte2": dte2, "iv2": f"{iv2:.2f}%" if iv2 is not None else "—",
+            "fwd_vol": fwd_txt, "ff": ff_txt,
+            "cal_debit": f"{debit:.2f}" if debit is not None else "—",
+            "earn_in_window": earn_txt,
+            "_tags": tags, "reason": reason or "ok"
+        })
+
+    return rows
+
 
     ed = [(e, _calc_dte(e)) for e in expiries]
     nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
@@ -799,4 +915,5 @@ st.markdown(
     "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
     unsafe_allow_html=True,
 )
+
 
