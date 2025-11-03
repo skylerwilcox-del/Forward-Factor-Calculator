@@ -1,4 +1,5 @@
 import math
+import time
 from datetime import datetime, date
 from typing import Optional, Tuple, List, Dict
 import re
@@ -22,15 +23,16 @@ st.session_state.setdefault("df", None)
 st.session_state.setdefault("tickers", [])
 st.session_state.setdefault("vol_topN", None)
 st.session_state.setdefault("trigger_run", False)
+st.session_state.setdefault("first_visit", True)
 
 # --- Config ---
 TOP_STOCKS = 27
 FIXED_ETFS = ["SPY", "QQQ", "VOO"]
 ETF_SET = set(FIXED_ETFS)
 
-# Download tuning
-BATCH_3MO = 60          # batch size for 3m multi-download (balance speed & reliability)
-MAX_WORKERS = 12        # for option-chain scanning only
+# Download tuning (reduced for better reliability)
+BATCH_3MO = 25
+MAX_WORKERS = 8
 
 # Large liquid fallback universe (used if ticker universe lookup fails)
 FALLBACK_LIQUID = [
@@ -96,8 +98,24 @@ def _chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
+# Simple retry decorator
+def _retry(n=3, wait=0.5):
+    def deco(fn):
+        def wrap(*a, **k):
+            last = None
+            for _ in range(n):
+                try:
+                    return fn(*a, **k)
+                except Exception as e:
+                    last = e
+                    time.sleep(wait)
+            # if all attempts failed, re-raise the last exception
+            raise last
+        return wrap
+    return deco
+
 # =========================
-# yfinance (cached)
+# yfinance (cached + hardened)
 # =========================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_us_stock_universe() -> List[str]:
@@ -115,7 +133,7 @@ def get_us_stock_universe() -> List[str]:
     candidates = [t for t in dict.fromkeys(candidates) if _is_clean_us_symbol(t)]
     if not candidates:
         candidates = FALLBACK_LIQUID.copy()
-    # Always ensure FIXED_ETFS and a few known actives are present if the API misses them
+    # Ensure ETFs + a known active are present
     for t in list(ETF_SET) + ["OPEN"]:
         if t not in candidates and _is_clean_us_symbol(t):
             candidates.append(t)
@@ -163,27 +181,56 @@ def _safe_single_download(ticker, period, interval):
         return pd.DataFrame()
 
 @st.cache_data(ttl=1800, show_spinner=False)
+@_retry(n=3, wait=0.5)
 def get_spot(ticker: str) -> Optional[float]:
     tk = yf.Ticker(ticker)
-    spot = tk.fast_info.get("last_price") or tk.info.get("regularMarketPrice")
+    spot = None
+    # fast_info
+    try:
+        fi = getattr(tk, "fast_info", {}) or {}
+        spot = fi.get("last_price")
+    except Exception:
+        pass
+    # info
     if spot is None:
-        px = tk.history(period="1d")
-        if not px.empty:
-            spot = float(px["Close"].iloc[-1])
+        try:
+            inf = getattr(tk, "info", {}) or {}
+            spot = inf.get("regularMarketPrice")
+        except Exception:
+            pass
+    # history
+    if spot is None:
+        px = tk.history(period="5d", interval="1d", auto_adjust=False)
+        if not px.empty and "Close" in px.columns:
+            spot = float(px["Close"].dropna().iloc[-1])
     return _first_float(spot)
 
 @st.cache_data(ttl=1200, show_spinner=False)
+@_retry(n=3, wait=0.7)
 def get_options(ticker: str) -> List[str]:
+    opts = []
+    tk = yf.Ticker(ticker)
     try:
-        opts = yf.Ticker(ticker).options or []
-        return [e for e in opts if isinstance(e, str) and len(e) == 10 and e[4] == "-" and e[7] == "-"]
+        opts = tk.options or []
     except Exception:
-        return []
+        pass
+    # Keep only YYYY-MM-DD
+    return [e for e in opts if isinstance(e, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", e)]
 
 @st.cache_data(ttl=900, show_spinner=False)
+@_retry(n=3, wait=0.7)
 def get_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     oc = yf.Ticker(ticker).option_chain(expiry)
-    return oc.calls.copy(), oc.puts.copy()
+    calls = oc.calls.copy() if hasattr(oc, "calls") else pd.DataFrame()
+    puts  = oc.puts.copy()  if hasattr(oc, "puts")  else pd.DataFrame()
+    # Standardize columns we rely on
+    for df in (calls, puts):
+        if not df.empty:
+            if "lastPrice" not in df.columns and "last_price" in df.columns:
+                df.rename(columns={"last_price":"lastPrice"}, inplace=True)
+            if "impliedVolatility" not in df.columns and "implied_volatility" in df.columns:
+                df.rename(columns={"implied_volatility":"impliedVolatility"}, inplace=True)
+    return calls, puts
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_next_earnings_date(ticker: str) -> Optional[date]:
@@ -202,7 +249,7 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
     except Exception:
         pass
     # Fallbacks
-    try_sources = (getattr(tk, "calendar", None), tk.info, getattr(tk, "fast_info", {}))
+    try_sources = (getattr(tk, "calendar", None), getattr(tk, "info", {}), getattr(tk, "fast_info", {}))
     for src in try_sources:
         if src is None:
             continue
@@ -219,42 +266,55 @@ def get_next_earnings_date(ticker: str) -> Optional[date]:
     return None
 
 # =========================
-# IV/FF calculations
+# IV/FF calculations (tolerant)
 # =========================
 def atm_iv(ticker: str, expiry: str, spot: float) -> Optional[float]:
     calls, puts = get_chain(ticker, expiry)
-    if calls.empty and puts.empty:
+    if (calls is None or calls.empty) and (puts is None or puts.empty):
         return None
-    strikes = pd.Index(sorted(set(calls["strike"]).union(set(puts["strike"])))).astype(float)
-    if len(strikes) == 0:
+
+    strikes = set()
+    if calls is not None and not calls.empty:
+        strikes |= set(pd.to_numeric(calls["strike"], errors="coerce").dropna().astype(float))
+    if puts is not None and not puts.empty:
+        strikes |= set(pd.to_numeric(puts["strike"], errors="coerce").dropna().astype(float))
+    if not strikes:
         return None
-    atm = float(min(strikes, key=lambda s: abs(s - spot)))
-    def iv_from(df: pd.DataFrame) -> Optional[float]:
+
+    atm = min(strikes, key=lambda s: abs(s - spot))
+
+    def _iv(df):
         if df is None or df.empty:
             return None
-        row = df.loc[df["strike"].astype(float) == atm]
-        return None if row.empty else _first_float(row["impliedVolatility"].iloc[0])
-    c_iv, p_iv = iv_from(calls), iv_from(puts)
-    if c_iv is None and p_iv is None:
-        return None
-    if c_iv is None:
-        return p_iv * 100.0
-    if p_iv is None:
-        return c_iv * 100.0
-    return 0.5 * (c_iv + p_iv) * 100.0
+        row = df.loc[pd.to_numeric(df["strike"], errors="coerce") == atm]
+        if row.empty:
+            return None
+        iv = _first_float(row["impliedVolatility"].iloc[0])
+        return None if iv is None else iv * 100.0
+
+    c_iv, p_iv = _iv(calls), _iv(puts)
+    if c_iv is not None and p_iv is not None:
+        return 0.5 * (c_iv + p_iv)
+    return c_iv if c_iv is not None else p_iv
 
 def common_atm_strike(ticker: str, exp1: str, exp2: str, spot: float) -> Optional[float]:
     c1, p1 = get_chain(ticker, exp1)
     c2, p2 = get_chain(ticker, exp2)
-    s1 = set(map(float, pd.Index(sorted(set(c1["strike"]).union(set(p1["strike"])))))) if not (c1.empty and p1.empty) else set()
-    s2 = set(map(float, pd.Index(sorted(set(c2["strike"]).union(set(p2["strike"])))))) if not (c2.empty and p2.empty) else set()
+    s1 = set()
+    if not (c1.empty and p1.empty):
+        s1 = set(map(float, pd.Index(sorted(set(pd.to_numeric(c1.get("strike", pd.Series()), errors="coerce").dropna().tolist() +
+                                                     pd.to_numeric(p1.get("strike", pd.Series()), errors="coerce").dropna().tolist()))))))
+    s2 = set()
+    if not (c2.empty and p2.empty):
+        s2 = set(map(float, pd.Index(sorted(set(pd.to_numeric(c2.get("strike", pd.Series()), errors="coerce").dropna().tolist() +
+                                                     pd.to_numeric(p2.get("strike", pd.Series()), errors="coerce").dropna().tolist()))))))
     inter = list(s1.intersection(s2))
     return float(min(inter, key=lambda s: abs(s - spot))) if inter else None
 
 def call_mid_at(calls: pd.DataFrame, strike: float) -> Optional[float]:
     if calls is None or calls.empty:
         return None
-    row = calls.loc[calls["strike"].astype(float) == strike]
+    row = calls.loc[pd.to_numeric(calls["strike"], errors="coerce") == strike]
     return None if row.empty else _safe_mid(row.iloc[0])
 
 def calendar_debit(ticker: str, e1: str, e2: str, spot: float):
@@ -291,6 +351,7 @@ def screen_ticker(ticker: str) -> List[Dict]:
             "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
             "cal_debit": "—","earn_in_window": "—","_tags": ["no_spot"]
         }]
+
     expiries = get_options(ticker)
     if not expiries:
         return [{
@@ -298,6 +359,7 @@ def screen_ticker(ticker: str) -> List[Dict]:
             "exp2": "—","dte2": "—","iv2": "—","fwd_vol": "—","ff": "—",
             "cal_debit": "—","earn_in_window": "—","_tags": ["no_exp"]
         }]
+
     ed = [(e, _calc_dte(e)) for e in expiries]
     nearest = lambda t: min(ed, key=lambda x: abs(x[1] - t)) if ed else None
 
@@ -318,7 +380,7 @@ def screen_ticker(ticker: str) -> List[Dict]:
     rows = []
 
     for label, (exp1, dte1), (exp2, dte2) in pairs:
-        # Determine earnings relationship against the pair window
+        # Earnings flags
         earn_txt = "—"
         tags: List[str] = []
         e1d, e2d = _expiry_to_date(exp1), _expiry_to_date(exp2)
@@ -326,34 +388,45 @@ def screen_ticker(ticker: str) -> List[Dict]:
         if earn_dt:
             earn_txt = earn_dt.strftime("%Y-%m-%d")
             if e1d and earn_dt < e1d:
-                # BLOCKED by strategy, but KEEP visible and mark red
-                tags.append("blocked")
+                tags.append("blocked")  # blocked by strategy but visible
             elif e1d and e2d and e1d <= earn_dt <= e2d:
-                # Allowed but flagged
-                tags.append("earn")
-            else:
-                # After Exp2: allowed, shown but not flagged (no special tag needed)
-                pass
+                tags.append("earn")     # allowed but flagged
 
-        # Compute IVs; if missing, skip to avoid blank rows
+        # Compute IVs (tolerant)
         iv1, iv2 = atm_iv(ticker, exp1, spot), atm_iv(ticker, exp2, spot)
-        if iv1 is None or iv2 is None:
+
+        # If both missing, still show the row so failures are visible
+        if iv1 is None and iv2 is None:
+            rows.append({
+                "ticker": ticker, "pair": label,
+                "exp1": exp1, "dte1": dte1, "iv1": "—",
+                "exp2": exp2, "dte2": dte2, "iv2": "—",
+                "fwd_vol": "—", "ff": "—", "cal_debit": "—",
+                "earn_in_window": earn_txt, "_tags": tags + ["no_iv"]
+            })
             continue
 
-        s1, s2 = iv1/100.0, iv2/100.0
-        T1, T2 = dte1/365.0, dte2/365.0
-        fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
-        _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
+        # If one is present, we can still compute forward where possible
+        fwd_txt, ff_txt = "—", "—"
+        if iv1 is not None and iv2 is not None:
+            s1, s2 = iv1/100.0, iv2/100.0
+            T1, T2 = dte1/365.0, dte2/365.0
+            fwd_sigma, ff = forward_and_ff(s1, T1, s2, T2)
+            if fwd_sigma is not None:
+                fwd_txt = f"{(fwd_sigma*100):.2f}%"
+            if ff is not None:
+                ff_txt = f"{(ff*100):.2f}%"
+                if ff >= 0.20:
+                    tags.append("hot")
 
-        if ff is not None and ff >= 0.20:
-            tags.append("hot")
+        _, _, _, debit = calendar_debit(ticker, exp1, exp2, spot)
 
         rows.append({
             "ticker": ticker, "pair": label,
-            "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%",
-            "exp2": exp2, "dte2": dte2, "iv2": f"{iv2:.2f}%",
-            "fwd_vol": f"{(fwd_sigma*100):.2f}%" if fwd_sigma is not None else "—",
-            "ff": f"{(ff*100):.2f}%" if ff is not None else "—",
+            "exp1": exp1, "dte1": dte1, "iv1": f"{iv1:.2f}%" if iv1 is not None else "—",
+            "exp2": exp2, "dte2": dte2, "iv2": f"{iv2:.2f}%" if iv2 is not None else "—",
+            "fwd_vol": fwd_txt,
+            "ff": ff_txt,
             "cal_debit": f"{debit:.2f}" if debit is not None else "—",
             "earn_in_window": earn_txt,
             "_tags": tags,
@@ -606,6 +679,11 @@ with colA:
 with colB:
     st.caption("Excludes today's partial volume until after ~4:05pm ET close.")
 
+# Auto-run once on first visit (common gotcha)
+if st.session_state.first_visit and not st.session_state.trigger_run:
+    st.session_state.trigger_run = True
+    st.session_state.first_visit = False
+
 # ---------- MAIN EXECUTION ----------
 if st.session_state.trigger_run:
     extras = _normalize_tickers(raw_extra)
@@ -648,6 +726,12 @@ df_current = st.session_state.df
 if df_current is None or df_current.empty:
     st.info("Click **Build List & Run** to rank the entire US universe and scan options.")
 else:
+    # Simple diagnostics to see where things failed
+    st.write({
+        "tickers_selected": len(st.session_state.tickers or []),
+        "df_rows": len(df_current),
+    })
+
     display_labels = [DISPLAY_MAP[k] for k in DISPLAY_KEYS if k in df_current.columns]
     default_label = DISPLAY_MAP.get("ff", display_labels[0])
 
@@ -673,7 +757,8 @@ else:
         blocked = isinstance(tags, (list, tuple, set)) and ("blocked" in tags)
         earn = isinstance(tags, (list, tuple, set)) and ("earn" in tags)
         hot = isinstance(tags, (list, tuple, set)) and ("hot" in tags)
-        # Priority: blocked (red) > both (orange) > earn (yellow) > hot (green)
+        no_iv = isinstance(tags, (list, tuple, set)) and ("no_iv" in tags)
+        # Priority colors
         if blocked:
             color = "#ffcdd2"  # red-ish for blocked
         elif earn and hot:
@@ -682,6 +767,8 @@ else:
             color = "#fff9c4"  # earnings in window
         elif hot:
             color = "#dcedc8"  # FF >= 0.20
+        elif no_iv:
+            color = "#e0e0e0"  # grey for missing IVs
         else:
             color = "#ffffff"
         return [f"background-color:{color}; color:#000000;"] * len(row)
@@ -700,7 +787,7 @@ else:
     """, unsafe_allow_html=True)
 
     st.markdown(styled.to_html(), unsafe_allow_html=True)
-    st.caption("🟥 Blocked (earnings before Exp 1) 🟨 Earnings in window 🟩 FF ≥ 0.20 🟧 Earnings+Hot")
+    st.caption("🟥 Blocked (earnings before Exp 1) 🟨 Earnings in window 🟩 FF ≥ 0.20 🟧 Earnings+Hot ⬜ No IV data")
 
 st.markdown(
     "<p style='text-align:center; font-size:14px; color:#888;'>Developed by <b>Skyler Wilcox</b> with GPT-5</p>",
